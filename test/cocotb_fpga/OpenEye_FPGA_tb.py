@@ -205,6 +205,10 @@ async def single_layer_test(dut):
         model = SimpleMNISTConvNet()
         model = o2m.get_model(model)
         trunc_model = truncate_model(model)
+    if os.environ.get("OPENEYE_EXPECT_LAYERS"):
+        expected_layers = int(os.environ["OPENEYE_EXPECT_LAYERS"])
+        assert len(trunc_model) == expected_layers, (
+            f"{layer_mode}: expected {expected_layers} layers, got {len(trunc_model)}")
     await execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, serial, ptp, trunc_model)
 
 def truncate_model(model):
@@ -254,6 +258,8 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
         cocotb.start_soon(rtl_test_utils.trace_iact_lanes(ptp, dut, openeye_parameter))
     if os.environ.get("TRACE_PSUM_SLICES"):
         cocotb.start_soon(rtl_test_utils.trace_psum_capture_slices(ptp, dut, openeye_parameter))
+    if os.environ.get("TRACE_CONV_WRITEBACK"):
+        cocotb.start_soon(rtl_test_utils.trace_conv_writeback(ptp, dut))
     if os.environ.get("TRACE_PE_CALC"):
         cocotb.start_soon(rtl_test_utils.trace_pe_calc_loop(ptp, dut, openeye_parameter))
     if os.environ.get("DUMP_CLUSTER_IACT"):
@@ -334,6 +340,12 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
             return ctr[0]
         dram.fmap[0] = _ramp(dram.fmap[0])
         logger.info("OPENEYE_RAMP_IACTS: layer-0 input set to 1..N in flat order")
+    if os.environ.get("OPENEYE_BIAS_STEP"):
+        # Give each output channel a distinct value after quantization so a
+        # channel permutation cannot pass a constant-weight regression.
+        step = int(os.environ["OPENEYE_BIAS_STEP"])
+        dram.bias = [[1 + step*f for f in range(len(bias))] for bias in dram.bias]
+        logger.info("OPENEYE_BIAS_STEP: bias[f] = 1 + %d*f", step)
     if os.environ.get("DUMP_INPUT_IACTS"):
         # Print the first activations of layer 0 so the values a PE holds can
         # be matched against the input vector. Every PE holding the same window

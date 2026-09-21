@@ -423,9 +423,6 @@ def write_iact_file(layer_params, layer_number, dram):
             iact_ref[c].close()
 
 def write_psum_file(layer_params, layer_number, dram, calculated_results):
-    manager = mp.Manager()
-    return_dict = manager.dict()
-    jobs = []
     if "Dense" in str(layer_params.layer_name):
         psum_ref = gtu.open_or_create_file('demo/layer_' + str(layer_number) + '/psum/psum_ref' + '_0.csv')
         for x in range(layer_params.filters):
@@ -443,6 +440,8 @@ def write_psum_file(layer_params, layer_number, dram, calculated_results):
                 psum_ref[c].write("\n")
             psum_ref[c].close()
     elif "Conv" in str(layer_params.layer_name):
+        manager = mp.Manager()
+        return_dict = manager.dict()
         run_jobs_bounded(
             lambda f: mp.Process(target = write_psum_file_conv_mp,
                                  args = (f, layer_params, calculated_results, return_dict)),
@@ -472,15 +471,13 @@ def write_psum_file_conv_mp(f, layer_params, calculated_results, return_dict):
 def collect_results(layer_number, layer_params, dram, serial):
     #Calculate Bias
     if "Dense" in str(layer_params.layer_name):
-        calculated_results = [0 for i in range(layer_params.filters)]
-        manager = mp.Manager()
-        return_dict = manager.dict()
-        jobs = []
-        run_jobs_bounded(
-            lambda x: mp.Process(target = calculate_dense_results_mp,
-                                 args = (x, layer_params, layer_number, dram, calculated_results[x], return_dict)),
-            layer_params.filters)
-        calculated_results = return_dict
+        # These dot products are small; spawning an interpreter per output
+        # costs far more than the arithmetic. Keep the same reference routine
+        # and output indexing, without multiprocessing startup or IPC.
+        calculated_results = {}
+        for x in range(layer_params.filters):
+            calculate_dense_results_mp(
+                x, layer_params, layer_number, dram, 0, calculated_results)
 
     elif "Depthwise" in str(layer_params.layer_name):
         calculated_results = [[[0 for i in range(layer_params.output_shape[2])] for j in range(layer_params.output_shape[1])]for k in range(layer_params.output_shape[3])]
@@ -556,7 +553,9 @@ def refresh_position(x_cor, y_cor, filter, y_line_counter, kernel_counter, layer
     return x_cor, y_cor, filter, y_line_counter, kernel_counter
 
 def calculate_conv_serial(params, layer_params, calculated_results, file_dma_ref):
-    words_per_transmission = params.DMA_BITWIDTH//params.DATA_PSUM_BITWIDTH
+    # FPGA readout transfers two psums per 64-bit beat (one per 32-bit
+    # beat), even when the accumulator itself is narrower than 32 bits.
+    words_per_transmission = params.DMA_BITWIDTH // 32
     filter_cycles = ((layer_params.filters//layer_params.used_psum_per_PE)//layer_params.different_kernels_per_calculation)
     output_number = layer_params.iact_size_y*layer_params.iact_size_x*layer_params.filters
     needed_refreshes = math.ceil(output_number / (layer_params.iact_size_x * layer_params.different_kernels_per_calculation * layer_params.y_lines_per_calculation) / layer_params.used_psum_per_PE)
@@ -595,7 +594,7 @@ def calculate_conv_serial(params, layer_params, calculated_results, file_dma_ref
                                         temp_string = gtu.to_twos_complement_string(0,params.DATA_PSUM_BITWIDTH) + temp_string
 
                                     x_cor = x_cor + 1
-                        file_dma_ref.write(temp_string+ "\n")
+                        file_dma_ref.write(temp_string.zfill(params.DMA_BITWIDTH) + "\n")
             filter = filter + 1
         if ((filter >= layer_params.filters)) :
             if (x_cor >= layer_params.psum_size_x+layer_params.psum_add_up) :
