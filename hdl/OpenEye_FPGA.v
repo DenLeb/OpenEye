@@ -214,8 +214,8 @@ module OpenEye_FPGA #(
     parameter UNPACKED_TRACES_ENABLED = 1,
 
     //Pooling Features
-    parameter MAX_POOLING = 1,
-    parameter AVERAGE_POOLING = 0,
+    parameter MAX_POOLING = 0,
+    parameter AVERAGE_POOLING = 1,
 
     //Channels per word
     parameter CHANNELS_PER_WORD = 4,
@@ -1681,17 +1681,26 @@ end
           end
           buffer_addr_temp_reg    <= 0;
           iact_buffer_data_w <= 0;
-          for (a = 0; a < 32; a = a + 1) begin
-            pooling_regs[a] <= -128;
-          end
-          for (a = 0; a < 8; a = a + 1) begin
-            pooling_stage_1[a] <= -128;
-          end
-          for (a = 0; a < 4; a = a + 1) begin
-            pooling_stage_2[a] <= -128;
-          end
-          for (a = 0; a < 2; a = a + 1) begin
-            pooling_stage_3[a] <= -128;
+          if (AVERAGE_POOLING == 1) begin
+            for (a = 0; a < 8; a = a + 1) begin
+              pooling_stage_1[a] <= 0;
+            end
+            for (a = 0; a < 4; a = a + 1) begin
+              pooling_stage_2[a] <= 0;
+            end
+          end else begin
+            for (a = 0; a < 32; a = a + 1) begin
+              pooling_regs[a] <= -128;
+            end
+            for (a = 0; a < 8; a = a + 1) begin
+              pooling_stage_1[a] <= -128;
+            end
+            for (a = 0; a < 4; a = a + 1) begin
+              pooling_stage_2[a] <= -128;
+            end
+            for (a = 0; a < 2; a = a + 1) begin
+              pooling_stage_3[a] <= -128;
+            end
           end
           pooling_stage_4 <= -128;
           quant_reg       <= 0;
@@ -2091,13 +2100,9 @@ end
               iact_channel_sending_cycle2 <= iact_channel_sending_cycle2 + 1;
               if (iact_channel_sending_cycle2 == channel_div_trans - 1) begin
                 iact_channel_sending_cycle2 <= 0;
-                // The pipeline forwards one activation pair per cycle
-                // (iact_input_window_q is 2*DATA_IACT_BITWIDTH wide), so for a
-                // fully-connected layer the window must advance by 2, not by
-                // NUM_GLB_IACT. Stepping by 3 skipped positions and, combined
-                // with the gate below, ended the sweep after 6 steps: 12 of 32
-                // activations. Convolution keeps the per-lane step.
-                current_x <= current_x + (fully_connected_layer ? 2 : NUM_GLB_IACT);
+                // The input sweep is serial: one channel pair of one pixel.
+                // Parallel activation ports are populated by the constructor.
+                current_x <= current_x + (fully_connected_layer ? 2 : 1);
                 if (!fully_connected_layer & (current_x == x_bound)) begin
                   current_x <= -padding_x;
                   current_y <= current_y + 1;
@@ -2118,10 +2123,16 @@ end
                   (current_y < iact_size_y)) begin
                 iact_input_window       <= iact_input_window >> 16;
                 iact_input_window_q     <= iact_input_window[15:0];
+                if (!fully_connected_layer && (iact_channels_per_pe == 1)) begin
+                  iact_input_window <= iact_input_window >> DATA_IACT_BITWIDTH;
+                  iact_input_window_q <= iact_input_window[DATA_IACT_BITWIDTH-1:0];
+                end
                 if (fully_connected_layer & (current_x + 1 >= fc_size_reg))
                   iact_input_window_q[15:8] <= 0;
                 relative_pos            <= relative_pos + 1;
-                if (relative_pos == IACT_RAM_CELLS - 1) begin
+                if (relative_pos == ((!fully_connected_layer && (iact_channels_per_pe == 1)) ?
+                    (IACT_RAM_CELLS_WORD_BITWIDTH / DATA_IACT_BITWIDTH - 1) :
+                    (IACT_RAM_CELLS_WORD_BITWIDTH / (2 * DATA_IACT_BITWIDTH) - 1))) begin
                   relative_pos             <= 0;
                   current_pos_in_iact_glb  <= current_pos_in_iact_glb + 1;
                   if (current_pos_in_iact_glb == IACT_RAM_CELLS - 1) begin
@@ -2375,12 +2386,20 @@ end
           //Counting and setting inputs for reading values
 
           //Ending Condition
-          if (iact_converter_cycles == (psum_size_x * 2)) begin
+          if ((iact_converter_cycles == (psum_size_x * 2) & (AVERAGE_POOLING == 0)) |
+              ((iact_converter_cycles == (8 - 1) & (AVERAGE_POOLING == 1)))) begin
             fsm_cycle               <= 0;
             iact_converter_cycles   <= 0;
             fsm_last_state          <= MAXPOOLING_READ;
             fsm_current_state       <= MAXPOOLING_SEND;
             buffer_addr_temp_reg    <= iact_buffer_addr_reg[0];
+            
+            if (AVERAGE_POOLING == 1) begin
+
+              for (a = 0; a < 4; a = a + 1) begin
+                pooling_stage_2[a] <= pooling_stage_2[a] >>> 4;
+              end
+            end
             for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
               iact_buffer_addr_reg[a] <= buffer_addr_temp_reg;
             end
@@ -2424,10 +2443,7 @@ end
             end else begin
               if (AVERAGE_POOLING == 1) begin
                 for (a = 0; a < 4; a = a + 1) begin
-                  pooling_stage_2[a] <= pooling_stage_1[2*a] + pooling_stage_1[2*a+1];
-                end
-                for (a = 0; a < 2; a = a + 1) begin
-                  pooling_stage_3[a] <= pooling_stage_2[2*a] >= pooling_stage_2[2*a+1];
+                  pooling_stage_2[a] <= pooling_stage_1[2*a] + pooling_stage_1[2*a+1] + pooling_stage_2[a];
                 end
                 for (a = 0; a < 32; a = a + 1) begin
                   for (b = 0; b < 2; b = b + 1) begin
@@ -2469,11 +2485,18 @@ end
           for (a = 0; a < IACT_RAM_CELLS; a = a + 1) begin
             iact_buffer_en_w[a] <= 0;
           end
-          for (a = 0; a < 4; a = a + 1) begin
-            iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <= pooling_buffer_old_q[a];
+          if (MAX_POOLING == 1) begin
+            for (a = 0; a < 4; a = a + 1) begin
+              iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <= pooling_buffer_old_q[a];
+            end
+            iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+(DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM/2)-1:0] <= iact_buffer_data_w >> 32;
           end
-          iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+(DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM/2)-1:0] <= iact_buffer_data_w >> 32;
-          
+          if (AVERAGE_POOLING == 1) begin
+            for (a = 0; a < 4; a = a + 1) begin
+              iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <= pooling_stage_2[a];
+            end
+            iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+(DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM/2)-1:0] <= iact_buffer_data_w >> 32;
+          end
           select_ram_counter2 <= select_ram_counter2 + 1;
           if (select_ram_counter2 == 8 - 1) begin
             select_ram_counter2 <= 0;
@@ -2482,7 +2505,13 @@ end
               iact_buffer_addr_reg[a] <= iact_buffer_addr_reg[a] + 1;
             end
           end
-          if (fsm_cycle >= psum_size_x - 1) begin
+          if ((fsm_cycle >= psum_size_x - 1) | 
+            AVERAGE_POOLING == 1) begin
+            if (AVERAGE_POOLING == 1) begin
+              for (a = 0; a < 4; a = a + 1) begin
+                pooling_stage_2[a] <= 0;
+              end
+            end
             if (finished_cycles_iact == needed_cycles-1) begin
               if (select_ram_counter2 == 8 - 1) begin
                 fsm_cycle             <= 0;
@@ -2514,6 +2543,9 @@ end
           end
           if (fsm_cycle == 2) begin
             fsm_cycle         <= 5;
+            if (AVERAGE_POOLING == 1) begin
+              fsm_cycle         <= 4;
+            end
             fsm_last_state    <= MAXPOOLING_WAIT;
             fsm_current_state <= MAXPOOLING_READ;
           end

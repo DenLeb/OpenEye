@@ -7,9 +7,10 @@
 
 Why this exists
 ---------------
-test_PE_CLUSTER.py has 32256 parametrisations, so the sparse failures are
+test_PE_CLUSTER.py's optional extended sweep has 32256 parametrisations, so the sparse failures are
 scattered through a matrix nobody runs in full and the *shape* of the fault is
-invisible. Holding shape and seed fixed and sweeping only SPARSE_WGHT turns the
+invisible. Its default is now a small smoke suite with pinned reproducers.
+Holding shape and seed fixed and sweeping only SPARSE_WGHT turns the
 same bug into a monotone curve, which is far more diagnostic than a list of
 failing ids:
 
@@ -53,7 +54,6 @@ import os
 import sys
 
 import pytest
-import cocotb_test.simulator
 
 # Same path setup as test_PE_CLUSTER.py: the cocotb testbench and its helper
 # are imported by bare module name, so this directory has to be importable.
@@ -62,6 +62,7 @@ sys.path.extend([os.path.abspath(os.getcwd()),
 tests_dir = os.path.abspath(os.path.dirname(__file__))
 
 import pe_cluster_test_utils as pctu
+from cluster_simulator import run_cluster_simulation
 from open_eye import hdl_dir, test_dir, vh_file_creator
 
 logger = logging.getLogger("cocotb")
@@ -102,14 +103,7 @@ def test_pe_cluster_weight_sparsity(SPARSE_WGHT, PARALLEL_MACS, request):
     target_dir = os.path.join(test_dir, ".temp", nodeid)
     os.makedirs(target_dir, exist_ok=True)
 
-    # parameters.vh is generated from the environment, so these must be set
-    # before create_vh_file_from_envvars runs.
-    os.environ["PARALLEL_MACS"] = str(PARALLEL_MACS)
-    os.environ["SPARSITY_EN"]   = "1"
-    vh_file_creator.create_vh_file_from_envvars(
-        target_dir, hdl_dir + "/", toplevel=toplevel)
-
-    cocotb_test.simulator.run(
+    run_cluster_simulation(
         python_search=[tests_dir],
         verilog_sources=verilog_sources,
         toplevel=toplevel,
@@ -117,7 +111,6 @@ def test_pe_cluster_weight_sparsity(SPARSE_WGHT, PARALLEL_MACS, request):
         sim_build=target_dir,
         testcase="start_test_pe",
         defines={"NO_TRACE": "TRUE"},
-        force_compile=True,
         simulator="icarus",
         extra_env={
             "CLOCK_LEN":               str(clk_cycle),

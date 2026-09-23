@@ -398,7 +398,7 @@ class LayerParameters(object):
         used_PEs_per_clm = self.used_PEs_Y/params.PEs_Y
         self.used_Y_cluster = math.ceil(used_PEs_per_clm)
         usable_pes = params.PEs_X*math.floor(params.Clusters/self.used_Y_cluster)
-        if (self.output_shape[1] >  usable_pes): # No
+        if (math.ceil(self.output_shape[1]/params.PEs_X) >=  math.ceil(usable_pes/params.PEs_X)): # No
             self.iact_x_line_repetitions = math.ceil(self.output_shape[1]/usable_pes)
             self.y_lines_per_calculation = 1
             self.different_kernels_per_calculation = 1
@@ -1028,14 +1028,14 @@ class LayerParameters(object):
         self.iact_read_inc_0 = int((self.iact_size_y + self.padding_y * 2) * self.needed_Iact_writes * self.channel_div_trans)
         self.iact_read_inc_0 = 1
         self.iact_read_inc_1 = self.channel_div_trans * self.needed_Iact_writes
-        self.iact_read_inc_1 = self.iact_repetitions_per_write
-        self.iact_read_inc_2 = (self.iact_size_y + self.padding_y * 2) * self.iact_repetitions_per_write
+        self.iact_read_inc_1 = self.iact_repetitions_per_write * params.NUM_GLB_IACT
+        self.iact_read_inc_2 = (self.iact_size_y + self.padding_y * 2) * self.iact_read_inc_1
         if (params.Clusters == 1):
             self.iact_read_inc_3 = self.channel_div_trans * params.NUM_GLB_PSUM * self.strideX
         else:
-            self.iact_read_inc_3 = self.channel_div_trans * self.needed_Iact_writes
+            self.iact_read_inc_3 = self.channel_div_trans * self.needed_Iact_writes * params.NUM_GLB_IACT
         #self.iact_read_inc_3 = 4
-        self.iact_read_inc_4 = self.iact_repetitions_per_write*self.strideY
+        self.iact_read_inc_4 = self.iact_read_inc_1*self.strideY
 
         if (self.used_channels == 1):
             lines_in_words = ((self.iact_size_y+(self.padding_y*2)+1)/2)
@@ -1276,6 +1276,9 @@ class LayerParameters(object):
 
         else:
             self.iact_buffer_words_per_write = self.needed_Iact_writes * self.channel_div_trans
+        # Input storage is serial, while the read schedule broadcasts one
+        # neighboring pixel per activation port in parallel.
+        self.iact_buffer_words_per_write *= params.NUM_GLB_IACT
         self.iact_words_per_compute = ((self.needed_Iact_writes * self.kernel_size[1] ) * self.used_channels) + 1
 
         self.lower_bound = (self.padding_y * self.buffer_cycles_for_x_iact * self.iact_x_line_repetitions) - 1
@@ -1745,7 +1748,11 @@ class LayerParameters(object):
         else:
             self.used_channels = 4
         self.diff_iact_layer_next_layer = layer_parameters[max_layers - layer_number - 2].used_channels
-        self.iact_converter_buffer_addr_max_cycles = math.ceil((((self.iact_size_y*self.diff_iact_layer))/(self.strideY*4)))
+        if (self.pooling_mode == 0):
+            self.iact_converter_buffer_addr_max_cycles = math.ceil((((self.iact_size_y*self.diff_iact_layer))/(self.strideY*4)))
+        else:
+            self.iact_converter_buffer_addr_max_cycles = math.ceil(self.diff_iact_layer/4)
+
         return
 
     def print_layer_parameters(self, debug_file):
