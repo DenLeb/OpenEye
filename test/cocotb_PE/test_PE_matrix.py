@@ -22,7 +22,7 @@ def test_matrix():
         parameters={
             "SPARSITY_EN": 0,
             "USE_DSP": 0,
-            "PARALLEL_MACS": 1,
+            "PARALLEL_MACS": 2,
         },
 
         defines={
