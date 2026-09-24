@@ -1,3 +1,51 @@
+"""
+PE Matrix Multiplication Testbench
+
+Purpose:
+This testbench verifies the standalone Processing Element (PE) in dense mode
+with PARALLEL_MACS = 2.
+
+The goal is to confirm that one PE can correctly process one input row of a
+matrix and calculate multiple output values using two MAC lanes in parallel.
+
+Test setup:
+    Input row:
+        A_row = [1, 2]
+
+    Weight matrix:
+        W = [
+            [5,  6,  7,  8],
+            [9, 10, 11, 12]
+        ]
+
+    Expected output:
+        A_row x W = [23, 26, 29, 32]
+
+The activation values are loaded into the PE input activation SPad and the
+weights are packed in pairs because PARALLEL_MACS = 2. Therefore, two weights
+are processed simultaneously by the two MAC lanes.
+
+The PE performs the following dot products:
+
+    1*5 + 2*9  = 23
+    1*6 + 2*10 = 26
+    1*7 + 2*11 = 29
+    1*8 + 2*12 = 32
+
+The testbench performs the following steps:
+    1. Reset and configure the PE.
+    2. Load the first input row [1, 2] into the activation SPad.
+    3. Load the corresponding weight matrix into the weight SPad.
+    4. Start the PE computation.
+    5. Supply zero initial partial sums (biases).
+    6. Read the resulting partial sums from the PE output.
+    7. Compare the hardware outputs against the expected result.
+
+This test currently verifies only one input row on a standalone PE.
+Calculation of multiple matrix rows in parallel is not covered by this test
+and is intended to be handled later using multiple PEs / the PE cluster.
+"""
+
 import cocotb
 
 from cocotb.clock import Clock
@@ -304,3 +352,26 @@ async def test_pe_matrix(dut):
 
     assert outputs == [23, 26, 29, 32], \
         f"Expected [23, 26, 29, 32], got {outputs}"
+
+
+    # ---------------------------------
+    # 16. Send second row of Input activations
+    # ---------------------------------
+
+    await Timer(10, unit="ns")
+    await RisingEdge(dut.clk_i)
+
+    dut.iact_data_i.value = (4 << 8) | 3
+
+    # Enable activation lane 0
+    dut.iact_enable_i.value = 1
+
+    # ... load activation 
+    # ... compute again
+    # ... read psum again
+    # ... load and read Outputs
+    #.
+    #.
+    #. 
+
+        
