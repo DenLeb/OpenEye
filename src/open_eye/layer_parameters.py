@@ -270,6 +270,7 @@ class LayerParameters(object):
         self.fsm_psum_limit = 1                # Number of cycles for psum
         self.cluster_per_conv_cycle = 4        # Number of clusters, that IActs are written to per single cycle
         self.iact_converter_max_cycles = 1     # Needed cycles for iact converter to write data to buffer
+        self.iact_x_pos_inc = 1
         self.iact_buffer_words_per_write = 12  # Needed words per write in Iact Cycles
         self.iact_words_per_compute = 0        # 
         self.needed_cycles = 1                 # Total needed cycles of rewritting of PEs
@@ -430,11 +431,11 @@ class LayerParameters(object):
             Updates self.used_Y_cluster with the final cluster count.
         """
         # Calculate how many PE rows (clusters in Y) are needed
-        self.used_Y_cluster = (math.ceil(self.used_PEs_Y/params.PEs_Y))
+        self.used_Y_cluster = math.ceil(self.used_PEs_Y/params.PEs_Y)
         # Distribute evenly across available Y clusters
-        self.used_Y_cluster = (math.floor(params.Clusters_Y/self.used_Y_cluster))
-        # Round up to get final cluster count
-        self.used_Y_cluster = (math.ceil(params.Clusters_Y/self.used_Y_cluster))
+        self.Y_Cluster_Packages = math.floor(params.Clusters_Y/self.used_Y_cluster)
+        self.used_Y_cluster = math.floor((params.Clusters_Y - (self.used_Y_cluster*self.Y_Cluster_Packages))/self.Y_Cluster_Packages) + self.used_Y_cluster
+        self.available_X_Cluster_Packages = self.Y_Cluster_Packages * params.Clusters_X
 
     def calculate_total_computations(self):
         """Calculate the total number of output positions for the convolution operation.
@@ -532,7 +533,8 @@ class LayerParameters(object):
             amount_of_psum_per_cycle = min(params.Clusters_Y*params.Clusters_X*params.PEs_X,8)
             # === MASKING PHASE 1: Handle non-aligned output width ===
             # If output width doesn't evenly divide by PEs_X, some PEs will be unused
-            calculation_ress = math.floor((params.Clusters * params.PEs_X)/self.different_kernels_per_calculation)
+            available_clusters = params.Clusters_X*self.Y_Cluster_Packages
+            calculation_ress = math.floor((available_clusters * params.PEs_X)/self.different_kernels_per_calculation)
             self.psum_add_up = (self.output_shape[1]) % calculation_ress
             self.psum_add_up = calculation_ress - self.psum_add_up
             self.psum_add_up = self.psum_add_up % calculation_ress
@@ -791,7 +793,6 @@ class LayerParameters(object):
                 # Delta: refreshes executed in this iteration
                 self.needed_refreshes_mx[layer_repetition][0] = self.needed_refreshes_mx[layer_repetition][2] - self.needed_refreshes_mx[layer_repetition][1]
 
-        self.needed_cycles = math.ceil(self.needed_refreshes_mx[0][0]/self.diff_iact_layer)*math.ceil(32/self.output_shape[1])
         self.needed_cycles = self.Used_refreshes
 
     def calculate_used_refreshes(self, params):
@@ -815,8 +816,8 @@ class LayerParameters(object):
             - Mode 2: Single X-cluster computation
             - Default: Full multi-cluster computation
         """
-        self.Used_refreshes = math.ceil(self.output_shape[2] * math.ceil(self.output_shape[1]/((params.Clusters//self.different_kernels_per_calculation)*params.PEs_X)))
-        self.Used_refreshes = math.ceil(self.used_Y_cluster * self.iact_transmissions_pe * self.Used_refreshes * math.ceil(math.ceil(self.filters/self.different_kernels_per_calculation)/self.used_psum_per_PE))
+        self.Used_refreshes = math.ceil(self.output_shape[2] * math.ceil(self.output_shape[1]/(((params.Clusters//self.used_Y_cluster)//self.different_kernels_per_calculation)*params.PEs_X)))
+        self.Used_refreshes = math.ceil(self.iact_transmissions_pe * self.Used_refreshes * math.ceil(math.ceil(self.filters/self.different_kernels_per_calculation)/self.used_psum_per_PE))
 
     def calculate_single_cluster_computation(self, params):
         """Determine if layer can use single-cluster optimization mode.
@@ -1025,16 +1026,15 @@ class LayerParameters(object):
         self.iact_read_limit_2 = self.needed_wght_cycles - 1
         self.iact_read_limit_3 = self.iact_x_line_repetitions - 1
         self.iact_read_limit_4 = math.ceil(self.iact_size_y/self.strideY) - 1
-        self.iact_read_inc_0 = int((self.iact_size_y + self.padding_y * 2) * self.needed_Iact_writes * self.channel_div_trans)
         self.iact_read_inc_0 = 1
-        self.iact_read_inc_1 = self.channel_div_trans * self.needed_Iact_writes
         self.iact_read_inc_1 = self.iact_repetitions_per_write * params.NUM_GLB_IACT
         self.iact_read_inc_2 = (self.iact_size_y + self.padding_y * 2) * self.iact_read_inc_1
-        if (params.Clusters == 1):
+        if ((self.Y_Cluster_Packages == 1) & (params.Clusters_X == 1)):
             self.iact_read_inc_3 = self.channel_div_trans * params.NUM_GLB_PSUM * self.strideX
         else:
             self.iact_read_inc_3 = self.channel_div_trans * self.needed_Iact_writes * params.NUM_GLB_IACT
-        #self.iact_read_inc_3 = 4
+            if (((params.Clusters_X * self.Y_Cluster_Packages)-1) * (params.NUM_GLB_PSUM * self.strideX) < self.kernel_shape[0] - 1):
+                self.iact_read_inc_3 = self.iact_read_inc_3 + (((params.Clusters_X * self.Y_Cluster_Packages)-1) * ((params.NUM_GLB_PSUM + 1) * self.strideX) - self.kernel_shape[0])
         self.iact_read_inc_4 = self.iact_read_inc_1*self.strideY
 
         if (self.used_channels == 1):
@@ -1195,9 +1195,8 @@ class LayerParameters(object):
 
 
         # Calculate partial sum storage requirements
-        self.psum_storage_cycles = self.diff_iact_layer * self.used_Y_cluster
-        if (self.choose_iact_storage_output):
-            self.psum_storage_cycles = self.diff_iact_layer
+        self.psum_storage_cycles = self.diff_iact_layer
+        self.psum_storage_cycles = self.diff_iact_layer
         temp1 = math.ceil(self.strideX * self.iact_size_x/((params.IACT_RAM_CELLS*8)//4))
         if ((self.iact_size_x/((params.IACT_RAM_CELLS*8)//4) >= 1) & (self.iact_x_line_repetitions >= 2)):
             temp2 = 2
@@ -1266,16 +1265,16 @@ class LayerParameters(object):
             self.iact_converter_max_cycles = self.buffer_cycles_for_x_iact*self.iact_x_line_repetitions*((self.iact_size_y + self.kernel_size[1]) - 1)
         if (self.buffer_cycles_for_x_iact == 1):
             full_temp = self.needed_Iact_writes * self.channel_div_trans
-            less_temp = (self.needed_Iact_writes-self.kernel_size[0] + self.strideX) * self.channel_div_trans
-            if (self.kernel_size[0] <= (params.Clusters-1) * params.NUM_GLB_PSUM * self.strideX):
-                self.iact_repetitions_per_write =  self.iact_x_line_repetitions * full_temp
-                self.iact_buffer_words_per_write =  self.iact_repetitions_per_write * ((self.iact_size_y + self.kernel_size[1]) - self.strideY) * math.ceil(self.channels/4)
-            else:
-                self.iact_repetitions_per_write = (self.iact_x_line_repetitions-1) * less_temp + full_temp
-                self.iact_buffer_words_per_write =  self.iact_repetitions_per_write * ((self.iact_size_y + self.kernel_size[1]) - self.strideY) * math.ceil(self.channels/4)
+            dilation_pes = (self.kernel_shape[0]-self.strideX) - ((math.floor(params.Clusters/self.used_Y_cluster) - 1) * params.NUM_GLB_PSUM * self.strideX)
+            dilation_pes = max(0,dilation_pes)
+            less_temp = full_temp - (dilation_pes * self.channel_div_trans)
+            self.iact_repetitions_per_write = (self.iact_x_line_repetitions-1) * less_temp + full_temp
+            self.iact_buffer_words_per_write =  self.iact_repetitions_per_write * ((self.iact_size_y + self.kernel_size[1]) - self.strideY) * self.diff_iact_layer
 
         else:
             self.iact_buffer_words_per_write = self.needed_Iact_writes * self.channel_div_trans
+        self.iact_x_pos_inc = self.strideX * (params.NUM_GLB_PSUM * (self.Y_Cluster_Packages * params.Clusters_X))
+        
         # Input storage is serial, while the read schedule broadcasts one
         # neighboring pixel per activation port in parallel.
         self.iact_buffer_words_per_write *= params.NUM_GLB_IACT
@@ -1492,9 +1491,9 @@ class LayerParameters(object):
             self.quantize[f][1] = 4
         self.fully_connected = 1
         # Global dataflow selection: with DATAFLOW="output_stationary" the
-        # dense layer runs with gemm_mode=1 so PE row j is hard-wired to iact
-        # GLB bank j (output-stationary GEMM datapath) instead of relying on
-        # the iact_choose pattern produced by the converter.
+        # dense layer runs with gemm_mode=1. When activation banks are shared
+        # between PE rows, the converter selects each row in turn; otherwise
+        # the GEMM datapath binds row j to activation bank j.
         if getattr(params, "DATAFLOW", "row_stationary") == "output_stationary":
             self.gemm_mode = 1
         self.output_cycles = 1
@@ -1526,7 +1525,6 @@ class LayerParameters(object):
         # calculate_computing_matrix.
         self.iact_x_add_up = self.iact_size_x
         self.calculate_transmission_cycles(params)
-
         # Calculate the number of refreshes needed for the layer
         
         temp = math.ceil(self.iact_size_x/(params.Clusters_Y*params.PEs_Y))
@@ -1543,6 +1541,7 @@ class LayerParameters(object):
         self.used_psum_per_PE = math.ceil(self.used_wght_per_PE/self.used_iact_per_PE)
         self.used_psum_per_PE = math.ceil(self.filters/params.Clusters_X)
         self.fsm_psum_limit = self.used_psum_per_PE + 3
+        self.x_pos_inc = params.Clusters_Y * self.used_iact_per_PE * params.NUM_GLB_WGHT
         #self.needed_wght_transmissions = self.needed_wght_transmissions * 1
         
         self.iact_read_limit_0 = 255

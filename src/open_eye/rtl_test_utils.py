@@ -394,8 +394,20 @@ async def trace_pe_iact(ptp, dut, oep, max_lines=200):
             return "?"
 
     lines = 0
+    last_state = None
     while lines < max_lines:
         await Timer(ptp.clk_cycle, unit=ptp.clk_cycle_unit)
+        # State changes and compute triggers, so iact writes can be placed
+        # against the PE's own schedule (a load that lands while the PE is
+        # waiting to send psums is easy to lose).
+        cur_state = txt(pe.current_state_computing)
+        cur_key = (cur_state, txt(pe.psum_enable_i), txt(pe.compute_i), txt(pe.psum_ready_o))
+        if cur_key != last_state:
+            logger.info("pestate t=%s st=%s compute_i=%s psum_en_i=%s psum_rdy_i=%s psum_rdy_o=%s data_set=%s words_iact=%s words_wght=%s",
+                        cocotb.utils.get_sim_time("ns"), cur_state, txt(pe.compute_i),
+                        txt(pe.psum_enable_i), txt(pe.psum_ready_i), txt(pe.psum_ready_o), txt(pe.data_set),
+                        txt(pe.second_spad_words_iact), txt(pe.second_spad_words_wght))
+            last_state = cur_key
         en = txt(pe.iact_enable_i)
         if "1" not in en:
             continue
@@ -404,6 +416,68 @@ async def trace_pe_iact(ptp, dut, oep, max_lines=200):
                     txt(pe.iact_select_i), en, txt(pe.iact_ready_o), txt(pe.iact_data_i),
                     txt(sp.we_i), txt(sp.addr_i), txt(sp.data_i))
         lines += 1
+
+
+async def trace_all_pe_states(ptp, dut, oep, max_lines=600):
+    """Per-change trace of every PE's FSM state and psum_ready_o (opt-in: TRACE_ALL_PE=t0,t1).
+
+    One line per cluster whenever any of its PEs changes state or ready flag,
+    restricted to sim time [t0, t1] ns. Each PE is printed as <state hex><ready>
+    in column-major order (col0 row0..2, col1 row0..2, ...). Shows which PE is
+    still computing when the psum collector decides all PEs are ready.
+    """
+    try:
+        t0, t1 = [float(v) for v in os.environ.get("TRACE_ALL_PE", "0,1e9").split(",")]
+    except ValueError:
+        t0, t1 = 0.0, 1e9
+    pes = {}
+    clusters = {}
+    for cx in range(oep.Clusters_X):
+        for cy in range(oep.Clusters_Y):
+            try:
+                base = dut.OpenEye_Parallel.gen_x[cx].gen_y[cy].OpenEye_Cluster.pe_cluster
+                pes[(cx, cy)] = [base.gen_X[c].gen_Y[r].pe
+                                 for c in range(oep.PEs_X) for r in range(oep.PEs_Y)]
+                clusters[(cx, cy)] = dut.OpenEye_Parallel.gen_x[cx].gen_y[cy].OpenEye_Cluster
+            except Exception as exc:
+                logger.error("trace_all_pe_states: cluster (%d,%d) not reachable (%s)", cx, cy, type(exc).__name__)
+                return
+
+    def one(pe):
+        try:
+            st = int(pe.current_state_computing.value)
+        except ValueError:
+            return "x"
+        try:
+            rdy = str(pe.psum_ready_o.value)
+        except Exception:
+            rdy = "?"
+        return "%x%s" % (st, rdy)
+
+    last = {}
+    lines = 0
+    while lines < max_lines:
+        await Timer(ptp.clk_cycle, unit=ptp.clk_cycle_unit)
+        now = cocotb.utils.get_sim_time("ns")
+        if now < t0:
+            continue
+        if now > t1:
+            return
+        for key, lst in pes.items():
+            cl = clusters[key]
+            def bits(name):
+                try:
+                    return str(getattr(cl, name).value)
+                except Exception:
+                    return "?"
+            cur = " ".join(one(pe) for pe in lst) + " | pe_en_out=%s ext_en=%s rdy_in=%s dly_rdy=%s pe_rdy_out=%s top_rdy=%s" % (
+                bits("pe_router_psum_enable_out"), bits("ext_mem_psum_enable_o"),
+                bits("pe_router_psum_ready_in"), bits("delay_cluster_ready_out"),
+                bits("pe_router_psum_ready_out"), bits("ready_src_top_psum"))
+            if last.get(key) != cur:
+                last[key] = cur
+                logger.info("allpe t=%s c(%d,%d) %s", now, key[0], key[1], cur)
+                lines += 1
 
 
 async def trace_converter(ptp, dut, oep, max_lines=260):
@@ -1118,6 +1192,19 @@ def compare_iact_storage(ptp, dut, iact_ref, oep, layer_params):
     if errors_logged > 16:
         logger.error("... and %d further Iact storage mismatches.", errors_logged - 16)
 
+    if os.environ.get("DUMP_IACT_IMAGE"):
+        # Whole expected image next to the DUT contents, bytes low to high, plus
+        # two addresses past the expected image to show stray writes.
+        rows = (len(expected) + oep.IACT_RAM_CELLS - 1) // oep.IACT_RAM_CELLS + 2
+        for addr in range(rows):
+            for cell in range(oep.IACT_RAM_CELLS):
+                index = addr * oep.IACT_RAM_CELLS + cell
+                ref_word = expected[index] if index < len(expected) else None
+                dut_word = _ram_word(dut.BUFFER_A[cell].iact_layer_buffer.impl.mem[half_offset + addr])
+                def fmt(w):
+                    return "--------" if w is None else " ".join("%02x" % ((w >> (8 * i)) & 0xFF) for i in range(8))
+                logger.info("iactimg addr=%d cell=%d ref=[%s] dut=[%s]%s", addr, cell,
+                            fmt(ref_word), fmt(dut_word), "" if ref_word == dut_word else " <<")
     if error_found:
         _log_iact_value_comparison(dut, oep, expected, cells_per_group, half_offset)
         _log_iact_buffer_occupancy(dut, oep)
@@ -1785,6 +1872,145 @@ async def trace_conv_writeback(ptp, dut, max_lines=160):
         lines += 1
 
 
+async def trace_wb_events(ptp, dut, max_lines=300):
+    """Trace the interlayer write-back counters (opt-in: TRACE_WB_EVENTS).
+
+    One line per clock while RECEIVE_PSUMS_TO_IACT is active and either a RAM
+    write enable is set or the psum FSM is reading (SEND_PSUM_TO_IACT). Shows
+    the pixel counter, the transposition counter and the storage counter so a
+    write that fires at the wrong pixel count is visible.
+    """
+    pp = dut.psum_pipeline_inst
+
+    def value(signal):
+        try:
+            return int(signal.value)
+        except ValueError:
+            return "X"
+
+    lines = 0
+    last = None
+    while lines < max_lines:
+        await FallingEdge(dut.clk_i)
+        if value(dut.fsm_current_state) != 11:
+            continue
+        en = [value(dut.iact_buffer_en_w[i]) for i in range(len(dut.iact_buffer_en_w))]
+        key = (value(pp.fsm_psum_current_state), value(dut.iact_to_psum_x_pos_counter),
+               value(dut.iact_to_psum_storage_counter), value(dut.iact_to_psum_trans_counter), tuple(en))
+        if key == last:
+            continue
+        last = key
+        try:
+            addr0 = hex(int(dut.iact_buffer_addr_reg[0].value))
+        except Exception:
+            addr0 = "?"
+        logger.info("wbtrace addr0=%s t=%s psum_st=%s psum_cyc=%s fsm_cyc=%s xpos=%s trans=%s stor=%s shifting=%s en_w=%s",
+                    addr0, cocotb.utils.get_sim_time("ns"), value(pp.fsm_psum_current_state),
+                    value(pp.fsm_psum_cycle), value(dut.fsm_cycle),
+                    value(dut.iact_to_psum_x_pos_counter), value(dut.iact_to_psum_trans_counter),
+                    value(dut.iact_to_psum_storage_counter), value(dut.iact_to_psum_start_shifting), en)
+        lines += 1
+
+
+async def trace_ram_writes(ptp, dut, max_lines=200):
+    """Log every clock in which any iact RAM write enable is set (opt-in: TRACE_RAM_WRITES).
+
+    Shows which main-FSM state performs each write to the activation buffer, the
+    cell-0 address it lands on, and the low word of the write bus, so a stray
+    write that clobbers an earlier layer's output can be attributed to a state.
+    """
+    def value(sig):
+        try:
+            return int(sig.value)
+        except Exception:
+            return "?"
+
+    lines = 0
+    while lines < max_lines:
+        await FallingEdge(dut.clk_i)
+        en = [value(dut.iact_buffer_en_w[i]) for i in range(len(dut.iact_buffer_en_w))]
+        if 1 not in en:
+            continue
+        try:
+            wdata = hex(int(str(dut.iact_buffer_data_w.value)[-64:], 2))
+        except Exception:
+            wdata = "?"
+        logger.info("ramwrite t=%s fsm=%s last=%s addr0=%s choose=%s en=%s wdata_cell0=%s",
+                    cocotb.utils.get_sim_time("ns"), value(dut.fsm_current_state),
+                    value(dut.fsm_last_state), value(dut.iact_buffer_addr_reg[0]),
+                    value(dut.choose_iact_buffer), en, wdata)
+        lines += 1
+
+
+async def trace_pooling(ptp, dut, max_lines=400):
+    """Trace the max-pooling FSM (opt-in: TRACE_POOLING).
+
+    One line per clock while fsm_current_state is MAXPOOLING_READ (12),
+    MAXPOOLING_SEND (13) or MAXPOOLING_WAIT (14): counters, the RAM read word,
+    the two comparator stages, the running max and the write bus. Unknown or
+    unreadable elements print as '?'.
+    """
+    def value(sig):
+        try:
+            return int(sig.value)
+        except Exception:
+            return "?"
+
+    def hexv(sig):
+        try:
+            t = str(sig.value)
+            return hex(int(t, 2)) if set(t) <= {"0", "1"} else t
+        except Exception:
+            return "?"
+
+    def bytes_w(sig):
+        # 32 bytes of the write bus, low to high, as hex pairs
+        try:
+            t = str(sig.value)
+            if not set(t) <= {"0", "1"}:
+                return "X..."
+            v = int(t, 2)
+            return " ".join("%02x" % ((v >> (8 * i)) & 0xFF) for i in range(len(t) // 8))
+        except Exception:
+            return "?"
+
+    def arr(name, n):
+        out = []
+        for i in range(n):
+            try:
+                out.append(value(getattr(dut, name)[i]))
+            except Exception:
+                out.append("?")
+        return out
+
+    lines = 0
+    in_pool = False
+    while lines < max_lines:
+        await FallingEdge(dut.clk_i)
+        st = value(dut.fsm_current_state)
+        if st not in (12, 13, 14):
+            in_pool = False
+            continue
+        if not in_pool:
+            in_pool = True
+            logger.info("poolstart t=%s", cocotb.utils.get_sim_time("ns"))
+            for addr in range(4):
+                logger.info("poolram addr=%d %s", addr, " | ".join(
+                    ("--------" if w is None else " ".join("%02x" % ((w >> (8 * i)) & 0xFF) for i in range(8)))
+                    for w in (_ram_word(dut.BUFFER_A[c].iact_layer_buffer.impl.mem[addr]) for c in range(4))))
+        logger.info("pooltrace t=%s st=%s cyc=%s cnv=%s fin=%s sel=%s sel2=%s addr0=%s rd=%s "
+                    "s1=%s s2=%s old=%s new=%s en_w=%s wbus=[%s]",
+                    cocotb.utils.get_sim_time("ns"), st, value(dut.fsm_cycle),
+                    value(dut.iact_converter_cycles), value(dut.finished_cycles_iact),
+                    value(dut.select_ram_counter), value(dut.select_ram_counter2),
+                    hexv(dut.iact_buffer_addr_reg[0]), hexv(dut.iact_buffer_data_r),
+                    arr("pooling_stage_1", 8), arr("pooling_stage_2", 4),
+                    arr("pooling_buffer_old", 4), arr("pooling_buffer_new", 4),
+                    [value(dut.iact_buffer_en_w[i]) for i in range(len(dut.iact_buffer_en_w))],
+                    bytes_w(dut.iact_buffer_data_w))
+        lines += 1
+
+
 async def trace_psum_capture(ptp, dut, oep, max_lines=400):
     """Per-cycle trace of the psum feed and capture (opt-in: TRACE_PSUM_CAPTURE).
 
@@ -1818,8 +2044,9 @@ async def trace_psum_capture(ptp, dut, oep, max_lines=400):
             continue
         if state not in (2, 3):
             continue
-        logger.info("psumtrace t=%s st=%d cyc=%s addr=%s rd=%s data_i=%s en_i=%s en_o=%s wen=%s",
+        logger.info("psumtrace t=%s st=%d rr=%s rdy_o=%s rdy_i=%s cyc=%s addr=%s rd=%s data_i=%s en_i=%s en_o=%s wen=%s",
                     cocotb.utils.get_sim_time("ns"), state,
+                    str(pp.results_ready.value), str(pp.psum_ready_o_reg.value), str(pp.psum_ready_i_reg.value),
                     field(pp.fsm_psum_cycle, 0, 8),
                     field(pp.psum_buffer_addr, 0, aw),
                     field(pp.psum_buffer_data_r, 0, 32, 20),
@@ -2456,9 +2683,10 @@ async def check_fc_activation_writes(dut, params, layer, activations):
     """
     channels = layer.used_iact_per_PE
     banks = params.NUM_GLB_IACT
+    pe_rows = params.PEs_Y
     rows = params.Clusters_Y
     mask = (1 << params.IACT_Bitwidth) - 1
-    writes_per_run = banks * channels // 2
+    writes_per_run = pe_rows * channels // 2
     expected_count = writes_per_run * layer.needed_wght_transmissions
     converters = []
     for column in range(params.Clusters_X):
@@ -2492,11 +2720,16 @@ async def check_fc_activation_writes(dut, params, layer, activations):
                     values = [(data >> (slot * params.IACT_WOH_Bitwidth)) & mask for slot in range(2)]
                 index = counts[key]
                 assert index < expected_count, f"Extra FC write in {key}"
-                assert (bank, address) == (index % banks, index // banks), (
+                tile, within_tile = divmod(index, writes_per_run)
+                pair, virtual_row = divmod(within_tile, pe_rows)
+                expected_bank = virtual_row % banks
+                rows_in_bank = (pe_rows + banks - 1 - expected_bank) // banks
+                expected_addr = (tile * (channels // 2) * rows_in_bank
+                                 + pair * rows_in_bank + virtual_row // banks)
+                assert (bank, address) == (expected_bank, expected_addr), (
                     f"FC write destination {key}: bank/address {(bank, address)}, word {index}")
-                tile, pair = divmod(address, channels // 2)
-                source = ((tile * rows + row) * banks * channels
-                          + pair * banks * 2 + bank * 2)
+                source = ((tile * rows + row) * pe_rows * channels
+                          + pair * pe_rows * 2 + virtual_row * 2)
                 expected = [int(activations[i]) & mask if i < len(activations) else 0
                             for i in (source, source + 1)]
                 assert values == expected, (

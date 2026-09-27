@@ -390,8 +390,8 @@ reg [1023:0] fst_path;
   wire [15:0]                       iact_glb_writing_cycles;
   reg [$clog2(CLUSTER_COLUMNS)-1:0] fsm_x_cl;          // Current cluster column being processed during weight loading.
   reg [$clog2(CLUSTER_ROWS)-1:0] fsm_y_cl;             // Current cluster row being processed during weight loading.
-  reg [$clog2(NUM_GLB_IACT)-1:0] fsm_iact_r;           // Current iact GLB index during iact loading (unused after refactor but kept for compatibility).
-  reg [$clog2(NUM_GLB_WGHT)-1:0] fsm_wght_r;           // Current weight GLB index; increments each DMA word in GET_WGHT, wraps at NUM_GLB_WGHT.
+  reg [((NUM_GLB_IACT > 1) ? $clog2(NUM_GLB_IACT) : 1)-1:0] fsm_iact_r; // Current iact GLB index during iact loading.
+  reg [((NUM_GLB_WGHT > 1) ? $clog2(NUM_GLB_WGHT) : 1)-1:0] fsm_wght_r; // Current weight GLB index during GET_WGHT.
   reg [$clog2(NUM_GLB_PSUM)-1:0] fsm_psum_r;           // Current psum GLB index during psum output; used by PSUM FSM.
   reg [$clog2(NUM_GLB_PSUM)-1:0] fsm_psum_r_q;         // One-cycle delayed fsm_psum_r; compensates for the pipelined RAM read in PSUM_SEND_RESULTS.
   reg results_ready;                                   // Local flag (combinatorial inside always block): AND of all active psum_enable_o or psum_ready_o signals.
@@ -552,6 +552,14 @@ reg [1023:0] fst_path;
   reg iact_converter_en_enc_reg[CLUSTER_COLUMNS-1:0][CLUSTER_ROWS-1:0];        // Pulse: run one encode step (outputs one word to the iact GLB interface).
   wire [7:0] x_lines_reg;                                                       // Number of x-lines per iact pass (from dma_storage); forwarded to iact_stream_constructor.
   reg send_data_reg;                                                             // One-cycle pulse that triggers the data-flow process to begin streaming to OpenEye_Parallel.
+  // Shared FC activation banks deliver PE rows one after another. Hold the
+  // compute pulse until the last row has written its input SPad.
+  reg [15:0] fc_readout_elapsed;
+  reg fc_compute_pending;
+  // Each row takes `channels` data clocks plus four FSM/RAM turnaround
+  // clocks; the final four clocks cover launch and the PE SPad write stage.
+  wire [15:0] fc_readout_required =
+      (iact_channels_per_pe + 16'd4) * NUM_GLB_WGHT + 16'd4;
   wire store_in_psum;                                                            // When 1: keep psums in psum_buffer for further accumulation instead of sending them out (from dma_storage).
   wire iact_converter_ready_w[CLUSTER_COLUMNS-1:0][CLUSTER_ROWS-1:0];          // Per-converter ready signal; high when the converter has finished its current batch.
 
@@ -582,6 +590,7 @@ reg [1023:0] fst_path;
   // -----------------------------------------------------------------------
   wire [7:0] iact_converter_max_cycles;             // Total y-lines to process including kernel overlap = iact_size_y + kernel_size - 1 (set in GET_WGHT).
   wire [11:0] iact_buffer_words_per_write;          // Words written per cycle into iact buffer per writing cycle
+  wire [11:0] iact_x_pos_inc;
   wire [7:0] iact_words_per_compute;
   wire [7:0] iact_converter_buffer_addr_max_cycles; // Maximum value of iact_converter_buffer_addr_cycles (from dma_storage).
   reg [7:0] iact_converter_cycles;                  // Current y-line counter [0..iact_converter_max_cycles-1]; drives the sliding window advancement.
@@ -836,7 +845,8 @@ reg [1023:0] fst_path;
   reg [7:0] iact_converter_c;      // Input channel index currently being configured.
   // additional register for fsm
   reg [$clog2(CLUSTER_ROWS+1)-1:0] fsm_row;        // Current CLUSTER_ROW target; steps by needed_y_cls_reg.
-  reg [$clog2(CLUSTER_ROWS+1)-1:0] fsm_row_offset; // Interleave offset; cycles 0..needed_y_cls_reg-1.
+  reg [$clog2(CLUSTER_ROWS+1)-1:0] fsm_row_temp;   // Temporary next CLUSTER_ROW target.
+  reg [$clog2(CLUSTER_ROWS*NUM_GLB_WGHT+1)-1:0] fsm_row_offset; // Interleave offset; cycles 0..needed_y_cls_reg-1.
   integer a, b, word, line;
   always @(posedge clk_i, negedge rst_n) begin
   if (!rst_n) begin
@@ -848,6 +858,7 @@ reg [1023:0] fst_path;
     iact_converter_y              <= 0;
     iact_converter_c              <= 0;
     fsm_row                       <= 0;
+    fsm_row_temp                  <= 0;
     fsm_row_offset                <= 0;
     for (a = 0; a < CLUSTER_COLUMNS; a=a+1) begin
       for (b = 0; b < CLUSTER_ROWS; b=b+1) begin
@@ -923,11 +934,13 @@ reg [1023:0] fst_path;
         end
         fsm_row <= fsm_row + needed_y_cls_reg;
         if (fsm_row + needed_y_cls_reg >= CLUSTER_ROWS) begin
-          fsm_row        <= fsm_row_offset + 1;
-          fsm_row_offset <= fsm_row_offset + NUM_GLB_IACT;
-          if (fsm_row_offset == NUM_GLB_IACT * (needed_y_cls_reg - 1)) begin
+          fsm_row        <= fsm_row_temp + 1;
+          fsm_row_temp   <= fsm_row_temp + 1;
+          fsm_row_offset <= fsm_row_offset + NUM_GLB_WGHT;
+          if (fsm_row_offset == NUM_GLB_WGHT * (needed_y_cls_reg - 1)) begin
             fsm_row        <= 0;
             fsm_row_offset <= 0;
+            fsm_row_temp   <= 0;
           end
         end
         iact_converter_x <= iact_converter_x + (CLUSTER_COLUMNS * iact_x_per_cluster);
@@ -1131,6 +1144,8 @@ end
       wght_buffer_rd_addr         <= 0;
       wght_buffer_rd_addr_storage <= 0;
       compute_reg                 <= 0;
+      fc_readout_elapsed          <= 0;
+      fc_compute_pending          <= 0;
       wght_sendable               <= 0;
       flat_help_var_send           = 0;
       for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
@@ -1149,6 +1164,14 @@ end
         end
       end
       compute_reg <= 0;
+      if (send_data_reg && !sending_data)
+        fc_readout_elapsed <= 0;
+      else if (sending_data && fc_readout_elapsed < fc_readout_required)
+        fc_readout_elapsed <= fc_readout_elapsed + 1;
+      if (fc_compute_pending && fc_readout_elapsed >= fc_readout_required) begin
+        compute_reg <= 1;
+        fc_compute_pending <= 0;
+      end
       if (send_data_reg | sending_data) begin
         sending_data <= 1;
         // wghts_per_pe and the RAM address count packed words. One word
@@ -1191,7 +1214,11 @@ end
             wght_buffer_en_r  <= 0;
             wght_enable_i_reg <= 0;
             if (current_cycle == 0) begin
-              compute_reg <= 1;
+              if (fully_connected_layer && (NUM_GLB_IACT < NUM_GLB_WGHT) &&
+                  (fc_readout_elapsed < fc_readout_required))
+                fc_compute_pending <= 1;
+              else
+                compute_reg <= 1;
             end
           end
         end
@@ -1208,16 +1235,15 @@ end
                 wght_sendable <= 0;
               end
               if (iact_channels_counter == iact_channel_max_cycles -1) begin
-                if (iact_channel_max_cycles != 1) begin
-                  wght_buffer_rd_addr <= wght_buffer_rd_addr_storage;
-                end
-                if (iact_router_counter == needed_y_cls_reg - 1) begin
+                //if (iact_channel_max_cycles != 1) begin
+                //  wght_buffer_rd_addr <= wght_buffer_rd_addr_storage;
+                //end
+                if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
                   wght_buffer_rd_addr <= wght_buffer_rd_addr;
                   wght_buffer_rd_addr_storage <= wght_buffer_rd_addr;
-                  if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
-                    wght_buffer_rd_addr_storage <= 0;
-                    wght_buffer_rd_addr         <= 0;
-                  end
+                  //if (iact_router_counter == needed_y_cls_reg - 1) begin #Fix later, will be used at a later stage of kernel_size > PE_Y
+                  wght_buffer_rd_addr         <= 0;
+                  wght_buffer_rd_addr_storage <= 0;
                 end
               end
             end
@@ -1239,6 +1265,8 @@ end
         wght_buffer_en_r    <= 0;
         wght_buffer_rd_addr <= 0;
         compute_reg         <= 0;
+        fc_readout_elapsed  <= 0;
+        fc_compute_pending  <= 0;
         wght_sendable       <= 1;
         flat_help_var_send = 0;
         for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
@@ -1258,6 +1286,8 @@ end
         wght_buffer_rd_addr            <= 0;
         wght_buffer_rd_addr_storage    <= 0;
         compute_reg                    <= 0;
+        fc_readout_elapsed             <= 0;
+        fc_compute_pending             <= 0;
         wght_sendable                  <= 1;
         flat_help_var_send              = 0;
         for (a = 0; a < CLUSTER_COLUMNS; a=a+1) begin
@@ -2149,7 +2179,6 @@ end
               end
             end
           end
-          //if (fsm_cycle == iact_buffer_words_per_write) begin
           if (fsm_cycle == iact_glb_writing_cycles) begin
             fsm_current_state     <= WAIT_CYCLE;
             fsm_cycle             <= 0;
@@ -2284,7 +2313,12 @@ end
               iact_to_psum_trans_counter  <= 1;
               iact_to_psum_shift_reg      <= iact_to_psum_mux_reg;
               iact_to_psum_start_shifting <= 1;
-              if (iact_to_psum_x_pos_counter >= iact_size_x - 1) begin
+              // A row is read as iact_x_add_up pixels (whole lanes of every used
+              // cluster); only the first iact_size_x are activations. Wrap the
+              // counter at the row period so the padding pixels are dropped by
+              // the (x_pos < iact_size_x) test above instead of being written as
+              // an extra word row.
+              if (iact_to_psum_x_pos_counter >= iact_x_add_up - 1) begin
                 iact_to_psum_x_pos_counter <= 0;
               end
             end            
@@ -2486,8 +2520,13 @@ end
             iact_buffer_en_w[a] <= 0;
           end
           if (MAX_POOLING == 1) begin
+            // Only the first psum_size_x pushes of a pass are pooled pixels. The
+            // final pass keeps pushing until a whole RAM row is complete, and
+            // those pad pixels must be 0 (the layout the next layer expects),
+            // not the -128 the running-max buffer starts from.
             for (a = 0; a < 4; a = a + 1) begin
-              iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <= pooling_buffer_old_q[a];
+              iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <=
+                  (fsm_cycle < psum_size_x) ? pooling_buffer_old_q[a] : 8'd0;
             end
             iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+(DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM/2)-1:0] <= iact_buffer_data_w >> 32;
           end
@@ -2852,7 +2891,6 @@ end
             .iact_choose_o               (iact_choose_w),
             .needed_y_cls_i              (needed_y_cls_reg),
             .needed_iact_channel_cycles_i(iact_channel_max_cycles),
-            .fc_size_i                   (fc_size_reg),
             .iact_x_add_up               (iact_x_add_up),
             .iact_channels_per_pe_i      (iact_channels_per_pe),
             .channel_div_trans           (channel_div_trans),
@@ -2865,6 +2903,7 @@ end
             .stride_y_i                  (stride_y),
             .y_lines_per_calc            (y_lines_per_calc),
             .fully_connected_i           (fully_connected_layer),
+            .x_pos_inc                   (iact_x_pos_inc),
             .needed_iact_buffer_words_i  (iact_buffer_words_per_write),
             .iact_words_per_compute      (iact_words_per_compute),
             .rd_loop_limit_0             (iact_read_limit_0),
@@ -3047,6 +3086,7 @@ end
         .fsm_psum_limit(fsm_psum_limit),
         .cluster_per_conv_cycle(cluster_per_conv_cycle),
         .iact_converter_max_cycles(iact_converter_max_cycles),
+        .iact_x_pos_inc(iact_x_pos_inc),
         .iact_buffer_words_per_write(iact_buffer_words_per_write),
         .iact_words_per_compute(iact_words_per_compute),
         .pooling_mode(pooling_mode),
@@ -3238,7 +3278,8 @@ end
         .bano_cluster_mode_i          (bano_cluster_mode_reg),
         .af_cluster_mode_i            (af_cluster_mode_reg),
         .pooling_cluster_mode_i       ({NUM_GLB_PSUM{1'd0}}),
-        .kernel_per_pe_cluster_i      (kernel_per_pe_cluster_reg[$clog2(NUM_GLB_WGHT)-1:0]),
+        .kernel_per_pe_cluster_i      (kernel_per_pe_cluster_reg[
+                                       ((NUM_GLB_WGHT > 1) ? $clog2(NUM_GLB_WGHT) : 1)-1:0]),
         .iact_x_line_repetitions_i    (iact_x_line_repetitions[3:0]),
         .kernel_size_y_i              (kernel_size_y),
         .input_activations_i          (input_activations),
@@ -3286,6 +3327,9 @@ end
                 iact_ready_o_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT + cr_gen * NUM_GLB_IACT + g_gen];*/
           assign IACT_CONVERTER_X[cc_gen].IACT_CONVERTER_Y[cr_gen].iact_ready_w[g_gen] =
                 (iact_ready_o_oep_w == (2**(CLUSTER_COLUMNS*CLUSTER_ROWS*NUM_GLB_IACT))-1);
+          // TODO DenLeb: per-cluster ready below breaks input height > 1 (test_conv_tall_input), please check
+          //assign IACT_CONVERTER_X[cc_gen].IACT_CONVERTER_Y[cr_gen].iact_ready_w[g_gen] =
+          //      iact_ready_o_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT + cr_gen * NUM_GLB_IACT + g_gen];
           assign iact_enable_i_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT + cr_gen * NUM_GLB_IACT + g_gen] =
                 IACT_CONVERTER_X[cc_gen].IACT_CONVERTER_Y[cr_gen].iact_enable_w[g_gen];
           assign iact_data_i_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT * TRANS_BITWIDTH_IACT +
