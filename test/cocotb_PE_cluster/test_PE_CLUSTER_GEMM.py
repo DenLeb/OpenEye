@@ -104,6 +104,7 @@ def test_pe_cluster_gemm_approach1(IACTSIZE_X, IACTSIZE_Y, WGHTSIZE_X, SEED, PE_
         sim_build=target_dir,
         testcase="start_test_gemm_approach1",
         defines=_pe_defines(PE_MODULE),
+        waves=True,
         simulator="icarus",
         extra_env={
             **_common_env,
@@ -140,6 +141,7 @@ def test_pe_cluster_gemm_approach2(IACTSIZE_X, IACTSIZE_Y, WGHTSIZE_X, SEED, PE_
         sim_build=target_dir,
         testcase="start_test_gemm_approach2",
         defines=_pe_defines(PE_MODULE),
+        waves=True,
         simulator="icarus",
         extra_env={
             **_common_env,
@@ -182,6 +184,7 @@ def test_pe_cluster_gemm_approach3(IACTSIZE_X, IACTSIZE_Y, WGHTSIZE_X, SEED, PE_
         testcase="start_test_gemm_approach3",
         parameters={"SYSTOLIC_GEMM_EN": 1, "PARALLEL_MACS": 1},
         defines=_pe_defines(PE_MODULE),
+        waves=True,
         simulator="icarus",
         extra_env={
             **_common_env,

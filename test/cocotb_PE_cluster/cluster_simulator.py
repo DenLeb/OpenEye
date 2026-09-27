@@ -23,7 +23,10 @@ def run_cluster_simulation(**kwargs):
     kwargs["parameters"] = {**parameters, **config}
     env.update({name: str(value) for name, value in config.items()})
     kwargs["extra_env"] = env
-    waves = os.environ.get("OPENEYE_CLUSTER_WAVES") == "1"
+    waves = (
+    bool(kwargs.get("waves", False))
+    or os.environ.get("OPENEYE_CLUSTER_WAVES", "").strip() == "1"
+    )
     kwargs["waves"] = waves
     kwargs["force_compile"] = False
 
