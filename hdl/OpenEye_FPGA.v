@@ -214,8 +214,8 @@ module OpenEye_FPGA #(
     parameter UNPACKED_TRACES_ENABLED = 1,
 
     //Pooling Features
-    parameter MAX_POOLING = 0,
-    parameter AVERAGE_POOLING = 1,
+    parameter MAX_POOLING = 1,
+    parameter AVERAGE_POOLING = 0,
 
     //Channels per word
     parameter CHANNELS_PER_WORD = 4,
@@ -757,12 +757,12 @@ reg [1023:0] fst_path;
             single_iteration  <= 1;
             single_iteration3 <= 1;
             if (iact_channels_counter == iact_channel_max_cycles -1) begin
-              if (iact_router_counter == needed_y_cls_reg - 1) begin
-                iact_cycle_count <= iact_cycle_count + 1;
-                if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
-                  iact_cycle_count <= 0;
-                end
+              //if (iact_router_counter == needed_y_cls_reg - 1) begin
+              iact_cycle_count <= iact_cycle_count + 1;
+              if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
+                iact_cycle_count <= 0;
               end
+              //end
             end
           end
         end else begin
@@ -781,12 +781,7 @@ reg [1023:0] fst_path;
         end
       end
       if ((RECEIVE_PSUMS_TO_IACT == fsm_current_state) | (fsm_current_state == WAIT_FOR_RESULTS)) begin
-        if (single_iteration) begin
-          single_iteration2 <= 1;
-        end
-        if (single_iteration == 0) begin
-          single_iteration2 <= 0;
-        end
+        single_iteration2 <= single_iteration;
       end
       if ((fsm_current_state == GET_PARAMETERS) |
         reset_cycle) begin
@@ -2048,6 +2043,14 @@ end
               select_ram_counter2 <= 0;
               buffer_addr_temp_reg <= -1;
               iact_buffer_data_w   <= 0;
+              // pooling_buffer_enable above pulses every layer's GET_QUANTIZE
+              // (not just pooling ones), which drives the running-max ring
+              // buffer's ready_i and drifts its read/write pointers before
+              // this layer's own pooling pass ever starts. The single
+              // set_pointer_start reset in MAXPOOLING_SEND only fires when
+              // leaving a pooling layer, so it does not protect against that
+              // drift. Reset again right here, before the first real push.
+              set_pointer_start    <= 1;
             end
           end
         end
@@ -2418,6 +2421,9 @@ end
         // -------------------------------------------------------------------
         MAXPOOLING_READ: begin
           //Counting and setting inputs for reading values
+
+          // One-cycle pulse from GET_QUANTIZE above; clear it once seen.
+          set_pointer_start <= 0;
 
           //Ending Condition
           if ((iact_converter_cycles == (psum_size_x * 2) & (AVERAGE_POOLING == 0)) |
@@ -2826,6 +2832,7 @@ end
             .wr_en_i(iact_buffer_en_w[j_gen]),
             .addr_i(iact_buffer_addr[j_gen]),
             .data_i(iact_buffer_data_w[j_gen*IACT_RAM_CELLS_WORD_BITWIDTH+:IACT_RAM_CELLS_WORD_BITWIDTH]),
+            .wr_mask_i(1'b0),
             .data_o(iact_buffer_data_r[j_gen*IACT_RAM_CELLS_WORD_BITWIDTH+:IACT_RAM_CELLS_WORD_BITWIDTH])
         );
     end
@@ -2989,6 +2996,7 @@ end
               // strides too doubles them for NUM_GLB_PSUM>1 and runs off the
               // end of the bus.
               .data_i (psum_buffer_data_w[i_gen*TRANS_BITWIDTH_PSUM*NUM_GLB_PSUM+j_gen*TRANS_BITWIDTH_PSUM*CLUSTER_COLUMNS*NUM_GLB_PSUM+g_gen*PSUM_BUFFER_WIDTH+:PSUM_BUFFER_WIDTH]),
+              .wr_mask_i(1'b0),
               .data_o (psum_buffer_data_r[i_gen*TRANS_BITWIDTH_PSUM*NUM_GLB_PSUM+j_gen*TRANS_BITWIDTH_PSUM*CLUSTER_COLUMNS*NUM_GLB_PSUM+g_gen*PSUM_BUFFER_WIDTH+:PSUM_BUFFER_WIDTH])
           );
         end
