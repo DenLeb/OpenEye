@@ -5,3 +5,4 @@
 */simulation/*
 *.fst
 *.fst.hier
+.sim_build_dma/
