@@ -264,10 +264,16 @@ def create_regmap_params_vh_file(regmap_yaml_path, output_vh_path=None, output_v
         dv.write(f"    input  wire [DMA_BITWIDTH-1:0] dma_data_i,  // Packed 64-bit data\n")
 
         # Output ports changed to WIRE!
+        # Generate output ports without a trailing comma
+        output_ports = []
+
         for regs in transmissions:
             for reg in regs:
-                dv.write(f"    output wire [{reg['width']-1}:0] {reg['name']},\n")
-        dv.seek(dv.tell()-2)  # Last comma removal
+                output_ports.append(
+                    f"    output wire [{reg['width']-1}:0] {reg['name']}"
+                )
+
+        dv.write(",\n".join(output_ports))
         dv.write("\n);\n\n")
 
         # Internal Pipeline Register Chain
