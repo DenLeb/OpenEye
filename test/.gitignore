@@ -5,4 +5,4 @@
 */simulation/*
 *.fst
 *.fst.hier
-test/cocotb_attention_qkt/.sim_build*/
+/cocotb_attention_qkt/.sim_build*/
