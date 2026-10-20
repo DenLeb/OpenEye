@@ -1,3 +1,4 @@
+
 `timescale 1ns / 1ps
 
 module attention_gemv_rom_top #(
@@ -8,6 +9,9 @@ module attention_gemv_rom_top #(
     input wire clk_i,
     input wire rst_ni,
     input wire start_i,
+
+    // Select input stream: 0 = Q[0], 1 = Q[1]
+    input wire bank_select_i,
 
     output wire busy_o,
     output wire adapter_busy_o,
@@ -34,19 +38,47 @@ module attention_gemv_rom_top #(
 );
 
     localparam [ADDR_WIDTH-1:0] ROM_WORD_COUNT = ROM_DEPTH;
-    
+
+    wire [DMA_WIDTH-1:0] rom_q0_data;
+    wire [DMA_WIDTH-1:0] rom_q1_data;
     wire [DMA_WIDTH-1:0] stream_data_wire;
 
+    reg active_bank_reg;
 
-    // ROM: returns a DMA word for each requested address
+    // Latch ROM selection when a new GEMV starts
+    always @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni)
+            active_bank_reg <= 1'b0;
+        else if (start_i && !busy_o)
+            active_bank_reg <= bank_select_i;
+    end
+
+    // ROM bank 0: Q[0]
     attention_gemv_rom #(
         .DMA_WIDTH  (DMA_WIDTH),
         .ADDR_WIDTH (ADDR_WIDTH),
-        .ROM_DEPTH  (ROM_DEPTH)
-    ) u_rom (
+        .ROM_DEPTH  (ROM_DEPTH),
+        .MEM_FILE   ("gemv_reference.mem")
+    ) u_rom_q0 (
         .addr_i (stream_addr_o),
-        .data_o (stream_data_wire)
+        .data_o (rom_q0_data)
     );
+
+    // ROM bank 1: Q[1]
+    attention_gemv_rom #(
+        .DMA_WIDTH  (DMA_WIDTH),
+        .ADDR_WIDTH (ADDR_WIDTH),
+        .ROM_DEPTH  (ROM_DEPTH),
+        .MEM_FILE   ("gemv_q1_reference.mem")
+    ) u_rom_q1 (
+        .addr_i (stream_addr_o),
+        .data_o (rom_q1_data)
+    );
+
+    // Select one ROM using the latched bank
+    assign stream_data_wire = active_bank_reg
+                            ? rom_q1_data
+                            : rom_q0_data;
 
     // Existing controller + DMA adapter
     attention_gemv_control_top #(

@@ -6,7 +6,9 @@
 // Purpose:
 //   Connect the verified GEMV ROM/control path to OpenEye_FPGA.
 //
-// This is an integration prototype for one fixed GEMV.
+// Top-level integration of the GEMV controller, DMA adapter, ROM banks,
+// and the real OpenEye FPGA accelerator.
+// Supports hardware-controlled GEMV execution with selectable input streams.
 //==============================================================
 
 module attention_gemv_openeye_top #(
@@ -17,6 +19,7 @@ module attention_gemv_openeye_top #(
     input  wire clk_i,
     input  wire rst_ni,
     input  wire start_i,
+    input wire bank_select_i,
 
     output wire busy_o,
     output wire adapter_busy_o,
@@ -57,6 +60,7 @@ module attention_gemv_openeye_top #(
         .clk_i          (clk_i),
         .rst_ni         (rst_ni),
         .start_i        (start_i),
+        .bank_select_i (bank_select_i),
 
         .busy_o         (busy_o),
         .adapter_busy_o (adapter_busy_o),

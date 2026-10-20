@@ -1,3 +1,6 @@
+# Single-GEMV integration test for the real OpenEye accelerator.
+# Verifies DMA input streaming and Q[0] results against golden references.
+
 from pathlib import Path
 
 import cocotb
