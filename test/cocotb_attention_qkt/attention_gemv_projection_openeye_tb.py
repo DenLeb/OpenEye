@@ -7,8 +7,27 @@ from pathlib import Path
 import cocotb
 import numpy as np
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, FallingEdge, Timer
+from cocotb.triggers import RisingEdge, FallingEdge, ReadOnly, Timer
 
+async def check_dense_mode(dut):
+    fpga = dut.u_openeye
+
+    # OpenEye calculation-related FSM states
+    COMPUTE_STATES = (7, 8, 9, 10)
+
+    while True:
+        await RisingEdge(dut.clk_i)
+        await ReadOnly()
+
+        state = int(fpga.fsm_current_state.value)
+
+        if state in COMPUTE_STATES:
+            mode = int(fpga.gemm_mode.value)
+
+            assert mode == 0, (
+                f"Dense Mode violation: "
+                f"gemm_mode={mode}, FSM state={state}"
+            )
 
 @cocotb.test()
 async def test_twelve_projection_gemvs(dut):
@@ -51,6 +70,7 @@ async def test_twelve_projection_gemvs(dut):
     dut.wght_wr_addr_i.value = 0
     dut.wght_wr_data_i.value = 0
 
+    cocotb.start_soon(check_dense_mode(dut))
     cocotb.start_soon(Clock(dut.clk_i, 20, unit="ns").start())
 
     for _ in range(8):

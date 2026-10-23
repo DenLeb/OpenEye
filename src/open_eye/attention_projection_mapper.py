@@ -1,7 +1,7 @@
 """OpenEye Attention Q/K/V projection stream and ROM-override image generator.
 
 First-stage, INT8, fixed-geometry implementation.  Uses OpenEye's existing
-DRAMContents, LayerParameters, and GemmMapper; no changes to OpenEye RTL.
+DRAMContents, LayerParameters, and DenseMapper; no changes to OpenEye RTL.
 
 By default, 4x8 input X and three 8x8 projection matrices are generated
 with a reproducible random seed. Alternatively, use --input-npz containing
@@ -26,7 +26,7 @@ from open_eye import DRAM
 from open_eye import layer_parameters as lp
 from open_eye import open_eye_parameters as oep
 from open_eye import stream_dicts as strdic
-from open_eye.gemm_mapper import GemmMapper
+from open_eye.dense_mapper import DenseMapper
 
 
 SECTION_NAMES = ("status", "iact", "wght", "psum", "quantize")
@@ -38,7 +38,7 @@ BASELINE_ENV = {
     "CLUSTER_COLUMNS": "2", "CLUSTER_ROWS": "2",
     "NUM_GLB_IACT": "3", "NUM_GLB_WGHT": "3", "NUM_GLB_PSUM": "4",
     "PARALLEL_MACS": "2", "BRANCHES": "1", "BUFFER_WIDTH": "12",
-    "RAM_CELLS": "32", "QUANT_AMOUNT": "1024", "DATAFLOW": "output_stationary",
+    "RAM_CELLS": "32", "QUANT_AMOUNT": "1024", "DATAFLOW": "row stationary",
 }
 
 
@@ -132,7 +132,7 @@ class AttentionProjectionMapper:
         dram.bias[0] = [0] * self.n_pad
         content = [dram.fmap[0], dram.weights[0], dram.bias[0]]
 
-        mapper = GemmMapper(self.params, layer_params, 0, content, 0, 0)
+        mapper = DenseMapper(self.params, layer_params, 0, content, 0, 0)
         mapper.make_stream()
         raw = mapper.get_stream()
         if any(getattr(layer_params, key) != 0 for key in ("skipIact", "skipWght", "skipPsum")):
@@ -248,7 +248,7 @@ def export_projection_images(
     np.savez(out / "inputs_used.npz", X=x, WQ=matrices["q"], WK=matrices["k"], WV=matrices["v"])
 
     manifest = {
-        "scope": "Q/K/V projection only; 12 sequential GEMV passes via existing gemm_mode=1",
+        "scope": "Q/K/V projection only; 12 sequential GEMV passes via existing gemm_mode=0",
         "skip_flags": {"skipIact": 0, "skipWght": 0, "skipPsum": 0},
         "precision": "signed INT8 operands / raw PSUM output",
         "shape": {"sequence_length": seq_len, "embedding_width": d_model,

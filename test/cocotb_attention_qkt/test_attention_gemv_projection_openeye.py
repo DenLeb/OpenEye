@@ -26,7 +26,7 @@ def test_attention_projection_openeye_top():
         "NUM_GLB_IACT": "3",
         "NUM_GLB_PSUM": "4",
         "NUM_GLB_WGHT": "3",
-        "DATAFLOW": "output_stationary",
+        "DATAFLOW": "row stationary",
         "BRANCHES": "1",
         "BUFFER_WIDTH": "12",
         "QUANT_AMOUNT": "1024",
