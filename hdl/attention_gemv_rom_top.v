@@ -1,0 +1,114 @@
+
+`timescale 1ns / 1ps
+
+module attention_gemv_rom_top #(
+    parameter integer DMA_WIDTH  = 64,
+    parameter integer ADDR_WIDTH = 16,
+    parameter integer ROM_DEPTH  = 939
+)(
+    input wire clk_i,
+    input wire rst_ni,
+    input wire start_i,
+
+    // Select input stream: 0 = Q[0], 1 = Q[1]
+    input wire bank_select_i,
+
+    output wire busy_o,
+    output wire adapter_busy_o,
+    output wire done_o,
+
+    // DMA transmit interface
+    input  wire                 dma_ready_i,
+    output wire [DMA_WIDTH-1:0] dma_data_o,
+    output wire                 dma_valid_o,
+
+    // DMA receive interface
+    input  wire [DMA_WIDTH-1:0] dma_result_data_i,
+    input  wire                 dma_result_valid_i,
+    input  wire                 dma_result_last_i,
+    output wire                 dma_result_ready_o,
+
+    // Result storage interface
+    output wire                 result_write_o,
+    output wire [DMA_WIDTH-1:0] result_data_o,
+    output wire [ADDR_WIDTH-1:0] result_addr_o,
+
+    // Debug: current ROM address
+    output wire [ADDR_WIDTH-1:0] stream_addr_o
+);
+
+    localparam [ADDR_WIDTH-1:0] ROM_WORD_COUNT = ROM_DEPTH;
+
+    wire [DMA_WIDTH-1:0] rom_q0_data;
+    wire [DMA_WIDTH-1:0] rom_q1_data;
+    wire [DMA_WIDTH-1:0] stream_data_wire;
+
+    reg active_bank_reg;
+
+    // Latch ROM selection when a new GEMV starts
+    always @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni)
+            active_bank_reg <= 1'b0;
+        else if (start_i && !busy_o)
+            active_bank_reg <= bank_select_i;
+    end
+
+    // ROM bank 0: Q[0]
+    attention_gemv_rom #(
+        .DMA_WIDTH  (DMA_WIDTH),
+        .ADDR_WIDTH (ADDR_WIDTH),
+        .ROM_DEPTH  (ROM_DEPTH),
+        .MEM_FILE   ("gemv_reference.mem")
+    ) u_rom_q0 (
+        .addr_i (stream_addr_o),
+        .data_o (rom_q0_data)
+    );
+
+    // ROM bank 1: Q[1]
+    attention_gemv_rom #(
+        .DMA_WIDTH  (DMA_WIDTH),
+        .ADDR_WIDTH (ADDR_WIDTH),
+        .ROM_DEPTH  (ROM_DEPTH),
+        .MEM_FILE   ("gemv_q1_reference.mem")
+    ) u_rom_q1 (
+        .addr_i (stream_addr_o),
+        .data_o (rom_q1_data)
+    );
+
+    // Select one ROM using the latched bank
+    assign stream_data_wire = active_bank_reg
+                            ? rom_q1_data
+                            : rom_q0_data;
+
+    // Existing controller + DMA adapter
+    attention_gemv_control_top #(
+        .DMA_WIDTH  (DMA_WIDTH),
+        .ADDR_WIDTH (ADDR_WIDTH)
+    ) u_control_top (
+        .clk_i               (clk_i),
+        .rst_ni              (rst_ni),
+
+        .start_i             (start_i),
+        .busy_o              (busy_o),
+        .done_o              (done_o),
+        .adapter_busy_o      (adapter_busy_o),
+
+        .stream_word_count_i (ROM_WORD_COUNT),
+        .stream_addr_o       (stream_addr_o),
+        .stream_data_i       (stream_data_wire),
+
+        .dma_ready_i         (dma_ready_i),
+        .dma_data_o          (dma_data_o),
+        .dma_valid_o         (dma_valid_o),
+
+        .dma_result_data_i   (dma_result_data_i),
+        .dma_result_valid_i  (dma_result_valid_i),
+        .dma_result_last_i   (dma_result_last_i),
+        .dma_result_ready_o  (dma_result_ready_o),
+
+        .result_write_o      (result_write_o),
+        .result_data_o       (result_data_o),
+        .result_addr_o       (result_addr_o)
+    );
+
+endmodule
