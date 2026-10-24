@@ -70,6 +70,16 @@ async def test_twelve_projection_gemvs(dut):
     dut.wght_wr_addr_i.value = 0
     dut.wght_wr_data_i.value = 0
 
+    # Q/K/V Buffer read interface
+    dut.q_rd_token_i.value = 0
+    dut.q_rd_feature_i.value = 0
+
+    dut.k_rd_token_i.value = 0
+    dut.k_rd_feature_i.value = 0
+
+    dut.v_rd_token_i.value = 0
+    dut.v_rd_feature_i.value = 0
+
     cocotb.start_soon(check_dense_mode(dut))
     cocotb.start_soon(Clock(dut.clk_i, 20, unit="ns").start())
 
@@ -230,3 +240,77 @@ async def test_twelve_projection_gemvs(dut):
     dut._log.info(
         "All 12 Q/K/V projection GEMVs PASSED without reset"
     )
+    # =====================================================
+    # Verify complete Q/K/V matrices stored in FPGA buffers
+    # =====================================================
+
+    buffer_ports = {
+        "q": dut.q_data_o,
+        "k": dut.k_data_o,
+        "v": dut.v_data_o,
+    }
+
+    for kind in ("q", "k", "v"):
+
+        expected_matrix = x @ weights[kind]
+
+        for token in range(4):
+            for feature in range(8):
+
+                getattr(dut, f"{kind}_rd_token_i").value = token
+                getattr(dut, f"{kind}_rd_feature_i").value = feature
+
+                await Timer(1, unit="ns")
+
+                raw = int(buffer_ports[kind].value)
+
+                # Signed 20-bit conversion
+                actual = raw
+                if actual & (1 << 19):
+                    actual -= 1 << 20
+
+                expected = int(expected_matrix[token, feature])
+
+                assert actual == expected, (
+                    f"{kind.upper()} Buffer mismatch: "
+                    f"token={token}, feature={feature}, "
+                    f"expected={expected}, actual={actual}"
+                )
+
+        dut._log.info(
+            "%s Buffer PASSED: all 32 matrix elements verified",
+            kind.upper()
+        )
+    
+    dut._log.info(
+        "All Q/K/V buffers verified: 96 matrix elements PASSED"
+    )
+    # Verify independent simultaneous Q/K/V reads
+    dut.q_rd_token_i.value = 1
+    dut.q_rd_feature_i.value = 3
+
+    dut.k_rd_token_i.value = 2
+    dut.k_rd_feature_i.value = 5
+
+    dut.v_rd_token_i.value = 3
+    dut.v_rd_feature_i.value = 1
+
+    await Timer(1, unit="ns")
+
+    cases = [
+        ("Q", dut.q_data_o, weights["q"], 1, 3),
+        ("K", dut.k_data_o, weights["k"], 2, 5),
+        ("V", dut.v_data_o, weights["v"], 3, 1),
+    ]
+
+    for name, signal, weight, token, feature in cases:
+        raw = int(signal.value)
+        actual = raw - (1 << 20) if raw & (1 << 19) else raw
+        expected = int((x @ weight)[token, feature])
+
+        assert actual == expected, (
+            f"{name} independent read failed: "
+            f"expected={expected}, actual={actual}"
+        )
+
+    dut._log.info("Independent Q/K/V address test PASSED")

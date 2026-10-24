@@ -41,6 +41,19 @@ module attention_projection_openeye_top #(
     output wire [DMA_WIDTH-1:0] result_data_o,
     output wire [ADDR_WIDTH-1:0] result_addr_o,
 
+    input wire [1:0] q_rd_token_i,
+    input wire [2:0] q_rd_feature_i,
+
+    input wire [1:0] k_rd_token_i,
+    input wire [2:0] k_rd_feature_i,
+
+    input wire [1:0] v_rd_token_i,
+    input wire [2:0] v_rd_feature_i,
+
+    output wire [19:0] q_data_o,
+    output wire [19:0] k_data_o,
+    output wire [19:0] v_data_o,
+
     // Debug address
     output wire [ADDR_WIDTH-1:0] stream_addr_o
 );
@@ -106,7 +119,39 @@ module attention_projection_openeye_top #(
         
         .stream_addr_o  (stream_addr_o)
     );
+    //==========================================================
+    // Q/K/V Projection Result Buffer
+    //==========================================================
 
+    attention_projection_result_buffer u_qkv_buffer (
+
+        .clk_i              (clk_i),
+        .rst_ni             (rst_ni),
+
+        // Capture the selected operation
+        .start_i            (start_i),
+        .token_select_i     (token_select_i),
+        .projection_select_i(projection_select_i),
+
+        // Receive calculated PSUM values
+        .result_write_i     (result_write_o),
+        .result_addr_i      (result_addr_o),
+        .result_data_i      (result_data_o),
+
+        .q_rd_token_i   (q_rd_token_i),
+        .q_rd_feature_i (q_rd_feature_i),
+
+        .k_rd_token_i   (k_rd_token_i),
+        .k_rd_feature_i (k_rd_feature_i),
+
+        .v_rd_token_i   (v_rd_token_i),
+        .v_rd_feature_i (v_rd_feature_i),
+
+        .q_data_o           (q_data_o),
+        .k_data_o           (k_data_o),
+        .v_data_o           (v_data_o)
+
+    );
     //==========================================================
     // Real OpenEye accelerator
     //==========================================================
