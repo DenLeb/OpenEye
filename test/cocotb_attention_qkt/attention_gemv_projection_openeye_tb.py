@@ -3,7 +3,6 @@
 # Verifies DMA streams, GEMV results, and selector stability.
 
 from pathlib import Path
-
 import cocotb
 import numpy as np
 from cocotb.clock import Clock
@@ -314,3 +313,15 @@ async def test_twelve_projection_gemvs(dut):
         )
 
     dut._log.info("Independent Q/K/V address test PASSED")
+
+
+    data_dir = Path(__file__).resolve().parent / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savez(
+        data_dir / "qk_raw_projection.npz",
+        q_raw=np.asarray(x @ weights["q"], dtype=np.int64),
+        k_raw=np.asarray(x @ weights["k"], dtype=np.int64),
+    )
+
+    dut._log.info("Q/K raw matrices exported for quantization analysis")
