@@ -9,6 +9,7 @@ import open_eye.vh_file_creator as vh_creator
 import open_eye.generator as generator
 
 from open_eye import hdl_dir
+from sympy import root
 
 
 def test_attention_projection_openeye_top():
