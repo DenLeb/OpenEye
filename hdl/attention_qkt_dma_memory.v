@@ -25,6 +25,8 @@ module attention_qkt_dma_memory #(
     // Clear packed operands before a new GEMV.
     input wire clear_i,
 
+    input wire q8_reload_i,
+
     // From Q8 activation packer
     input wire [DMA_WIDTH-1:0] q8_word_i,
     input wire q8_word_valid_i,
@@ -96,7 +98,10 @@ module attention_qkt_dma_memory #(
 
         end else begin
 
-            if (q8_word_valid_i && q8_word_ready_o) begin
+            if (q8_reload_i) begin
+                q8_packed <= 0;
+                q8_loaded <= 1'b0;
+            end else if (q8_word_valid_i && q8_word_ready_o) begin
                 q8_packed <= q8_word_i;
                 q8_loaded <= 1'b1;
             end
