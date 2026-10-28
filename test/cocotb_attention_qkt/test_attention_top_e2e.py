@@ -217,7 +217,7 @@ async def check_complete_attention_dataflow(dut):
     )
     assert seen_qkt == {0, 1, 2, 3}, f"Missing QKT GEMV(s): {seen_qkt}"
     assert counts["projection"] == 384, (
-        f"Expected 12*8 projection DMA result beats, got {counts['projection']}"
+        f"Expected 12*32 projection DMA result beats, got {counts['projection']}"
     )
     assert counts["qkt"] == 16, (
         f"Expected 4*4 QKT DMA result beats, got {counts['qkt']}"
