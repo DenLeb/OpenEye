@@ -4,7 +4,9 @@ from pathlib import Path
 
 import cocotb
 import numpy as np
-
+import matplotlib
+matplotlib.use("Agg")  # Save figures without opening a GUI
+import matplotlib.pyplot as plt
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, Timer
 from softmax_exp_reference import exp_row
@@ -24,6 +26,62 @@ def reference_row(scores, q_shift, k_shift):
         min(32768, (e * 32768 + total // 2) // total)
         for e in exp_values
     ]
+
+
+def plot_softmax_heatmap(scores, probabilities_fixed):
+    # Original QKT scores
+    scores = np.asarray(scores, dtype=np.int64)
+
+    # Actual RTL probabilities: UQ1.15 -> float
+    probabilities_fixed = np.asarray(
+        probabilities_fixed, dtype=np.int64
+    )
+    probabilities = probabilities_fixed / 32768.0
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(12, 5), constrained_layout=True
+    )
+
+    # Left: QKT scores
+    im0 = axes[0].imshow(scores)
+    axes[0].set_title("QKT Score Matrix (INT20)")
+    fig.colorbar(im0, ax=axes[0], label="Score")
+
+    # Right: Hardware Softmax output
+    im1 = axes[1].imshow(
+        probabilities, vmin=0, vmax=1
+    )
+    axes[1].set_title("Hardware Softmax (UQ1.15)")
+    fig.colorbar(im1, ax=axes[1], label="Probability")
+
+    for ax in axes:
+        ax.set_xlabel("Key Token")
+        ax.set_ylabel("Query Token")
+        ax.set_xticks(range(4))
+        ax.set_yticks(range(4))
+
+    # Write values inside heatmap cells
+    for row in range(4):
+        for col in range(4):
+            axes[0].text(
+                col, row, str(scores[row, col]),
+                ha="center", va="center", fontsize=8
+            )
+
+            axes[1].text(
+                col, row, f"{probabilities[row, col]:.3f}",
+                ha="center", va="center", fontsize=10
+            )
+
+    output_path = (
+        Path(__file__).resolve().parent
+        / "softmax_heatmap.png"
+    )
+
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+    print(f"Heatmap saved: {output_path}")
 
 
 async def score_buffer_model(dut, model):
@@ -55,7 +113,7 @@ async def score_buffer_model(dut, model):
 
 
 async def check_matrix(dut, model, matrix, q_shift, k_shift,
-                       stall_every=0):
+                       stall_every=0, save_heatmap=False):
 
     expected = [
         reference_row(row, q_shift, k_shift)
@@ -135,6 +193,9 @@ async def check_matrix(dut, model, matrix, q_shift, k_shift,
         f"Actual:\n{actual}"
     )
 
+    if save_heatmap:
+        plot_softmax_heatmap(matrix, actual)
+
     dut._log.info(
         "Matrix PASS (q_shift=%d, k_shift=%d, stalls=%d)",
         q_shift, k_shift, stall_every
@@ -187,7 +248,7 @@ async def test_full_softmax_matrix(dut):
         k_shift = int(f["k_shift"])
 
     await check_matrix(
-        dut, model, scores, q_shift, k_shift
+        dut, model, scores, q_shift, k_shift, save_heatmap=True
     )
 
     # Test 2: All-equal scores
