@@ -89,6 +89,11 @@ def test_attention_top_e2e():
         "attention_qkt_k8_packer.v",
         "attention_qkt_dma_memory.v",
         "attention_qkt_score_buffer.v",
+        "attention_softmax_exp.v",
+        "attention_softmax_divider.v",
+        "attention_softmax_normalize.v",
+        "attention_softmax_row.v",
+        "attention_softmax.v",
     ):
         path = Path(hdl_dir) / name
         assert path.is_file(), f"Missing RTL module: {path}"
@@ -97,7 +102,7 @@ def test_attention_top_e2e():
     sources.append(str(generated))
 
     cocotb_test.simulator.run(
-        python_search=[str(here)],
+        python_search=[str(here), str(here.parent / "cocotb_attention_softmax")],
         verilog_sources=sources,
         toplevel="attention_top",
         module="test_attention_top_e2e",
@@ -134,6 +139,7 @@ def _reference_quantize(values):
 
 @cocotb.test()
 async def check_complete_attention_dataflow(dut):
+    from softmax_exp_reference import exp_row
     projection_dir = Path(os.environ["ATTENTION_E2E_PROJECTION_DIR"])
     with np.load(projection_dir / "inputs_used.npz", allow_pickle=False) as t:
         x = t["X"].astype(np.int64)
@@ -157,6 +163,8 @@ async def check_complete_attention_dataflow(dut):
     dut.wght_wr_data_i.value = 0
     dut.score_rd_token_i.value = 0
     dut.score_rd_index_i.value = 0
+    dut.prob_rd_token_i.value = 0
+    dut.prob_rd_index_i.value = 0
 
     cocotb.start_soon(Clock(dut.clk_i, 20, unit="ns").start())
     for _ in range(12):
@@ -243,7 +251,86 @@ async def check_complete_attention_dataflow(dut):
         f"Golden Q8:\n{q8}\nGolden K8:\n{k8}\n"
         f"Expected:\n{golden_scores}\nActual:\n{actual_scores}"
     )
+    # Reference Softmax using the existing fixed-point EXP LUT model
+    golden_probabilities = []
+
+    for row in golden_scores:
+        exp_values = [
+            int(v) for v in exp_row(
+                [int(score) for score in row],
+                q_shift,
+                k_shift
+            )
+        ]
+
+        total = sum(exp_values)
+        assert total > 0
+
+        probabilities = [
+            (exp * 32768 + total // 2) // total
+            for exp in exp_values
+        ]
+
+        golden_probabilities.append(probabilities)
+
+    golden_probabilities = np.asarray(
+        golden_probabilities, dtype=np.int64
+    )
+
+    # Global DONE must imply that Softmax is complete.
+    assert int(dut.softmax_complete_o.value) == 1, (
+        "Global DONE but Softmax probability buffer is incomplete"
+    )
+
+    actual_probabilities = np.empty((4, 4), dtype=np.int64)
+
+    for token in range(4):
+        for j in range(4):
+            dut.prob_rd_token_i.value = token
+            dut.prob_rd_index_i.value = j
+
+            await Timer(1, unit="ns")
+
+            assert int(dut.prob_rd_valid_o.value) == 1, (
+                f"Missing probability P[{token},{j}]"
+            )
+
+            actual_probabilities[token, j] = int(
+                dut.prob_rd_data_o.value
+            )
+
     dut._log.info(
         "PASS: single OpenEye and DMA adapter, 12 projections, "
         "hardware Q/K quantization, 4 QKT GEMVs, all 16 scores bit-exact"
+    )
+    dut._log.info(
+        "Expected Softmax probabilities (UQ1.15):\n%s",
+        golden_probabilities
+    )
+
+    dut._log.info(
+        "Actual RTL Softmax probabilities (UQ1.15):\n%s",
+        actual_probabilities
+    )
+
+    assert np.array_equal(
+        actual_probabilities,
+        golden_probabilities
+    ), (
+        f"Softmax End-to-End mismatch\n"
+        f"Expected:\n{golden_probabilities}\n"
+        f"Actual:\n{actual_probabilities}"
+    )
+
+    # Each normalized row should sum to approximately 1.0.
+    for token in range(4):
+        row_sum = int(actual_probabilities[token].sum())
+
+        assert abs(row_sum - 32768) <= 2, (
+            f"Invalid probability sum in row {token}: {row_sum}"
+        )
+
+    dut._log.info(
+        "PASS: 12 projections, quantization, 4 QKT GEMVs, "
+        "16 scores and 16 Softmax probabilities"
     )

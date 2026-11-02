@@ -12,6 +12,8 @@ module attention_top_scheduler (
     input  wire gemv_done_i,
     input  wire quant_done_i,
     input  wire operands_ready_i,
+    input wire scores_complete_i,
+    input wire softmax_done_i,
     output wire projection_start_o,
     output wire quant_start_o,
     output wire qkt_memory_clear_o,
@@ -24,6 +26,7 @@ module attention_top_scheduler (
     output wire [1:0] token_o,
     output wire [1:0] projection_o,
     output wire busy_o,
+    output wire softmax_start_o,
     output reg done_o
 );
     localparam [3:0]
@@ -38,6 +41,8 @@ module attention_top_scheduler (
         QKT_GEMV_START    = 4'd8,
         QKT_GEMV_WAIT     = 4'd9,
         QKT_RELOAD        = 4'd10,
+        SOFTMAX_START     = 4'd12,
+        SOFTMAX_WAIT      = 4'd13,
         FINISH            = 4'd11;
 
     reg [3:0] state;
@@ -57,6 +62,8 @@ module attention_top_scheduler (
     assign k8_packer_start_o = (state == QKT_PACK_START) && (token == 2'd0);
     assign gemv_start_o = (state == PROJ_START) || (state == QKT_GEMV_START);
     assign qkt_result_enable_o = (state == QKT_GEMV_WAIT);
+    assign softmax_start_o =
+    (state == SOFTMAX_START) && scores_complete_i;
 
     always @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
@@ -101,15 +108,30 @@ module attention_top_scheduler (
                 QKT_PACK_START: state <= QKT_PACK_WAIT;
                 QKT_PACK_WAIT: if (operands_ready_i) state <= QKT_GEMV_START;
                 QKT_GEMV_START: state <= QKT_GEMV_WAIT;
-                QKT_GEMV_WAIT: if (gemv_done_i) begin
-                    if (token == 2'd3)
-                        state <= FINISH;
-                    else begin
-                        token <= token + 2'd1;
-                        state <= QKT_RELOAD;
+                QKT_GEMV_WAIT: begin
+                    if (gemv_done_i) begin
+                        if (token == 2'd3) begin
+                            // All four QKT GEMVs have finished.
+                            state <= SOFTMAX_START;
+                        end else begin
+                            token <= token + 2'd1;
+                            state <= QKT_RELOAD;
+                        end
                     end
                 end
-                QKT_RELOAD: state <= QKT_PACK_START;
+                QKT_RELOAD: begin
+                    state <= QKT_PACK_START;
+                end
+                SOFTMAX_START: begin
+                    // Do not start until all 16 scores are valid.
+                    if (scores_complete_i)
+                        state <= SOFTMAX_WAIT;
+                end
+                SOFTMAX_WAIT: begin
+                    // Wait until the entire 4x4 Softmax has completed.
+                    if (softmax_done_i)
+                        state <= FINISH;
+                end
                 FINISH: begin
                     done_o <= 1'b1;
                     state <= IDLE;

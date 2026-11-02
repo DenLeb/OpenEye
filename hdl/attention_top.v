@@ -54,6 +54,13 @@ module attention_top #(
     output wire signed [19:0] score_rd_data_o,
     output wire score_rd_valid_o,
 
+    // Softmax probability read interface
+    input  wire [1:0] prob_rd_token_i,
+    input  wire [1:0] prob_rd_index_i,
+    output wire [15:0] prob_rd_data_o,
+    output wire        prob_rd_valid_o,
+    output wire        softmax_complete_o,
+    
     // Debug outputs for integration tests.
     output wire [1:0] active_token_o,
     output wire [1:0] active_projection_o,
@@ -81,6 +88,22 @@ module attention_top #(
     wire operands_ready;
     wire gemv_done;
 
+    wire softmax_start;
+    wire softmax_done;
+    wire softmax_busy;
+
+    // Softmax Score Buffer read requests
+    wire [1:0] softmax_score_rd_token;
+    wire [1:0] softmax_score_rd_index;
+
+    // Shared Score Buffer read response
+    wire signed [19:0] score_buffer_rd_data;
+    wire score_buffer_rd_valid;
+
+    // Selected read address
+    wire [1:0] selected_score_rd_token;
+    wire [1:0] selected_score_rd_index;
+
     attention_top_scheduler u_scheduler (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
@@ -103,6 +126,9 @@ module attention_top #(
         .token_o(token_select),
         .projection_o(projection_select),
         .busy_o(busy_o),
+        .softmax_start_o(softmax_start),
+        .scores_complete_i(scores_complete_o),
+        .softmax_done_i(softmax_done),
         .done_o(done_o)
     );
     assign active_token_o = token_select;
@@ -339,6 +365,17 @@ module attention_top #(
     wire [1:0] mapped_score_index = {result_addr[0], result_addr[1]};
     wire score_write = qkt_result_enable && result_write && (result_addr < 4);
 
+    assign selected_score_rd_token =
+    softmax_busy ? softmax_score_rd_token
+                 : score_rd_token_i;
+
+    assign selected_score_rd_index =
+    softmax_busy ? softmax_score_rd_index
+                 : score_rd_index_i;
+
+    assign score_rd_data_o  = score_buffer_rd_data;
+    assign score_rd_valid_o = score_buffer_rd_valid;
+
     attention_qkt_score_buffer #(
         .NUM_TOKENS(4),
         .NUM_SCORES(4),
@@ -351,11 +388,41 @@ module attention_top #(
         .write_token_i(token_select),
         .write_score_i(mapped_score_index),
         .write_data_i(result_data[19:0]),
-        .read_token_i(score_rd_token_i),
-        .read_score_i(score_rd_index_i),
-        .read_data_o(score_rd_data_o),
-        .read_valid_o(score_rd_valid_o),
+        .read_token_i(selected_score_rd_token),
+        .read_score_i(selected_score_rd_index),
+        .read_data_o(score_buffer_rd_data),
+        .read_valid_o(score_buffer_rd_valid),
         .complete_o(scores_complete_o)
+    );
+
+    
+    //===================== ATTENTION SOFTMAX ===============================
+
+    attention_softmax u_softmax (
+        .clk_i(clk_i),
+        .rst_ni(rst_ni),
+        .start_i(softmax_start),
+
+        // Quantization shifts
+        .q_shift_i(q_shift),
+        .k_shift_i(k_shift),
+
+        // QKT Score Buffer read interface
+        .score_rd_token_o(softmax_score_rd_token),
+        .score_rd_index_o(softmax_score_rd_index),
+        .score_rd_data_i(score_buffer_rd_data),
+        .score_rd_valid_i(score_buffer_rd_valid),
+
+        // Probability read interface
+        .prob_rd_token_i(prob_rd_token_i),
+        .prob_rd_index_i(prob_rd_index_i),
+        .prob_rd_data_o(prob_rd_data_o),
+        .prob_rd_valid_o(prob_rd_valid_o),
+
+        // Control
+        .busy_o(softmax_busy),
+        .done_o(softmax_done),
+        .complete_o(softmax_complete_o)
     );
 
 `ifndef SYNTHESIS
