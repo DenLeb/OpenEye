@@ -187,9 +187,9 @@ class OpenEyeParameters(object):
 
         # Width of IACT GLBs
         try:
-            self.BUFFER_WIDTH = int(os.getenv("BUFFER_WIDTH"))
+            self.BUFFER_WIDTH_IACT = int(os.getenv("BUFFER_WIDTH_IACT"))
         except:
-            self.BUFFER_WIDTH = 10
+            self.BUFFER_WIDTH_IACT = 10
 
         # Width of WGHT GLBs
         try:
@@ -232,7 +232,7 @@ class OpenEyeParameters(object):
         try:
             self.SPARSITY_EN = int(os.getenv("SPARSITY_EN"))
         except:
-            self.SPARSITY_EN = 1        # Sparsity enabled
+            self.SPARSITY_EN = 1          # Sparsity enabled
 
         try:
             self.DMA_BITWIDTH = int(os.getenv("DMA_BITWIDTH"))
@@ -242,7 +242,32 @@ class OpenEyeParameters(object):
         try:
             self.STRIDE_ENABLED = int(os.getenv("STRIDE_ENABLED"))
         except:
-            self.STRIDE_ENABLED = 0          # AXI bus width for DMA transfers (64 bits)
+            self.STRIDE_ENABLED = 0         # Enable or Disable Stride ability
+
+        try:
+            self.CYCLE_WIDTH = int(os.getenv("CYCLE_WIDTH"))
+        except:
+            self.CYCLE_WIDTH = 16        # Width of cycle counters
+
+        try:
+            self.LIMIT_SIZE_IACT = int(os.getenv("LIMIT_SIZE_IACT"))
+        except:
+            self.LIMIT_SIZE_IACT = 16        # Width of iact limit
+
+        try:
+            self.LIMIT_SIZE_WGHT = int(os.getenv("LIMIT_SIZE_WGHT"))
+        except:
+            self.LIMIT_SIZE_WGHT = 16        # Width of wght limit
+
+        try:
+            self.LIMIT_SIZE_PSUM = int(os.getenv("LIMIT_SIZE_PSUM"))
+        except:
+            self.LIMIT_SIZE_PSUM = 16        # Width of psum limit
+
+        try:
+            self.DEPTHWISE_ENABLED = int(os.getenv("DEPTHWISE_ENABLED"))
+        except:
+            self.DEPTHWISE_ENABLED = 16        # Enable DW Conv Calculations
 
         # === COMMUNICATION MODE ===
         self.SERIAL = serial           # Serial (DMA) vs parallel communication mode

@@ -78,7 +78,7 @@ class ConvMapper(LayerMapper):
     """
         
     def __init__(self, params, layer_params, layer_repetition, dram_layer_content, sparse_iacts, sparse_wghts):
-        input_mapper = ConvIactStreamMapper(params, layer_params, layer_repetition, dram_layer_content[0], sparse_iacts)
+        input_mapper = ConvIactStreamMapper(params, layer_params, layer_repetition, dram_layer_content[0][0], sparse_iacts)
         weight_mapper = ConvWghtStreamMapper(params, layer_params, layer_repetition, dram_layer_content[1], sparse_wghts)
         bias_mapper = ConvPsumStreamMapper(params, layer_params, layer_repetition, dram_layer_content[2])
         super().__init__(params, layer_params, layer_repetition, dram_layer_content, input_mapper, weight_mapper, bias_mapper)
@@ -137,12 +137,12 @@ class ConvMapper(LayerMapper):
         # Uses pack_registers() utility from regmap_pack module
         from open_eye.generator import pack_registers
         words = pack_registers({
-        "wght_cycles_reg": layer_params.needed_wght_transmissions,
         "stride_x": layer_params.strideX,
         "stride_y": layer_params.strideY,
         "skipIact_reg": layer_params.skipIact,
         "skipWght_reg": layer_params.skipWght,
         "skipPsum_reg": layer_params.skipPsum,
+        "dw_mode": 0,
         "psum_q": layer_params.psum_delay,
         "kernel_per_pe_cluster_reg": layer_params.kernel_per_pe_cluster,
         "kernel_size_x": layer_params.kernel_size[0],
@@ -204,7 +204,6 @@ class ConvMapper(LayerMapper):
         "iact_buffer_words_per_write": layer_params.iact_buffer_words_per_write,
         "iact_words_per_compute": layer_params.iact_words_per_compute,
         "pooling_mode": 0,
-        "used_wght_per_PE": layer_params.used_wght_per_PE,
         "overhang_discrepancy": layer_params.overhang_discrepancy,
         "psum_output_words": layer_params.psum_output_words,
         "iact_read_limit_0" : layer_params.iact_read_limit_0,

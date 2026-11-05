@@ -104,7 +104,7 @@ def create_vh_file(openeye_parameter: object, filename: str = 'parameters.vh',
             txt_file.write(f"parameter NUM_GLB_PSUM  = {openeye_parameter.NUM_GLB_PSUM},\n")
             txt_file.write(f"parameter NUM_GLB_WGHT = {openeye_parameter.NUM_GLB_WGHT},\n")
             txt_file.write(f"parameter IACT_RAM_CELLS = {openeye_parameter.IACT_RAM_CELLS},\n")
-            txt_file.write(f"parameter BUFFER_WIDTH = {openeye_parameter.BUFFER_WIDTH},\n")
+            txt_file.write(f"parameter BUFFER_WIDTH_IACT = {openeye_parameter.BUFFER_WIDTH_IACT},\n")
             txt_file.write(f"parameter BUFFER_WIDTH_WGHT = {openeye_parameter.BUFFER_WIDTH_WGHT},\n")
             txt_file.write(f"parameter BUFFER_WIDTH_PSUM = {openeye_parameter.BUFFER_WIDTH_PSUM},\n")
             txt_file.write(f"parameter BRANCHES = {openeye_parameter.BRANCHES},\n")
@@ -118,6 +118,11 @@ def create_vh_file(openeye_parameter: object, filename: str = 'parameters.vh',
             txt_file.write(f"parameter TRANS_BITWIDTH_WGHT = {openeye_parameter.WGHT_Trans_Bitwidth},\n")
             txt_file.write(f"parameter TRANSMISSIONS = {TRANSMISSIONS},\n")
             txt_file.write(f"parameter STRIDE_ENABLED = {openeye_parameter.STRIDE_ENABLED},\n")
+            txt_file.write(f"parameter CYCLE_WIDTH = {openeye_parameter.CYCLE_WIDTH},\n")
+            txt_file.write(f"parameter LIMIT_SIZE_IACT = {openeye_parameter.LIMIT_SIZE_IACT},\n")
+            txt_file.write(f"parameter LIMIT_SIZE_WGHT = {openeye_parameter.LIMIT_SIZE_WGHT},\n")
+            txt_file.write(f"parameter LIMIT_SIZE_PSUM = {openeye_parameter.LIMIT_SIZE_PSUM},\n")
+            txt_file.write(f"parameter DEPTHWISE_ENABLED = {openeye_parameter.DEPTHWISE_ENABLED},\n")
             
     else:
         with open(filename, 'w') as txt_file:

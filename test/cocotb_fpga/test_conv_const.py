@@ -98,7 +98,7 @@ def _run_conv_const(layer_mode, const_value, cluster_rows, num_glb_iact,
     # Use the standard quantization table: 1024 entries of 40 bits produce
     # 640 DMA words, matching GET_QUANTIZE's derived transfer count.
     os.environ["BRANCHES"]        = "1"
-    os.environ["BUFFER_WIDTH"]    = "12"
+    os.environ["BUFFER_WIDTH_IACT"] = "12"
     os.environ["QUANT_AMOUNT"]    = "1024"
     os.environ["RAM_CELLS"]       = "32"
     os.environ["CLUSTER_COLUMNS"] = "2"
@@ -235,7 +235,7 @@ def test_conv_channel_order(request):
 
 
 @pytest.mark.parametrize("num_glb_iact", [1, 3])
-@pytest.mark.parametrize("input_channels", [1, 4])
+@pytest.mark.parametrize("input_channels", [1, 2, 3, 4])
 def test_conv_input_mapping(input_channels, num_glb_iact, request):
     """Separate channel packing from activation-port routing without write-back."""
     _run_conv_const("Convolution_Single", 8, 2,
