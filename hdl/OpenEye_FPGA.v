@@ -134,6 +134,8 @@ module OpenEye_FPGA #(
     parameter IS_TOPLEVEL   = 1,
     parameter SERIAL        = 1,
 
+    parameter ATTENTION_PSUM_ENABLE = 0,
+
     parameter ADDR_IACT_BITWIDTH = 4,
     parameter ADDR_WGHT_BITWIDTH = 8,
 
@@ -275,8 +277,20 @@ module OpenEye_FPGA #(
     output reg [DMA_BITWIDTH-1 : 0] data_dma_o,
     output reg                      enable_dma_o,
 
-    output reg last_data_o
+    output reg last_data_o,
 
+    // Attention PSUM control
+    input wire attention_mode_i,
+    input wire [3:0] psum_page_i,
+
+    // Direct PSUM read interface
+    input wire psum_result_rd_req_i,
+    input wire [3:0] psum_result_rd_page_i,
+    input wire [2:0] psum_result_rd_feature_i,
+
+    output wire psum_result_rd_ready_o,
+    output reg psum_result_rd_valid_o,
+    output reg [DATA_PSUM_BITWIDTH-1:0] psum_result_rd_data_o 
 );
 
   //#######################
@@ -286,6 +300,75 @@ module OpenEye_FPGA #(
   // output rst_n is used everywhere inside this module instead of rst_ni directly.
   //#######################
   wire rst_n; // Synchronized, active-low reset; driven by RST_SYNC below.
+
+  wire psum_attention_active =
+    ATTENTION_PSUM_ENABLE && attention_mode_i;
+
+  wire [BUFFER_WIDTH_PSUM-1:0] psum_page_offset =
+      psum_attention_active
+      ? ({{(BUFFER_WIDTH_PSUM-4){1'b0}}, psum_page_i} << 5)
+      : {BUFFER_WIDTH_PSUM{1'b0}};
+
+  localparam [1:0]
+      EXT_IDLE      = 2'd0,
+      EXT_RAM_READ  = 2'd1,
+      EXT_PIPE_WAIT = 2'd2,
+      EXT_CAPTURE   = 2'd3;
+
+  reg [1:0] ext_rd_state;
+  reg [BUFFER_WIDTH_PSUM-1:0] ext_rd_addr;
+
+  wire ext_rd_active = (ext_rd_state == EXT_RAM_READ);
+
+  assign psum_result_rd_ready_o =
+      psum_attention_active &&
+      (ext_rd_state == EXT_IDLE) &&
+      (fsm_psum_current_state == 0) &&
+      !(|psum_buffer_en_w) &&
+      !(|psum_buffer_en_r);
+
+  always @(posedge clk_i or negedge rst_n) begin
+      if (!rst_n) begin
+          ext_rd_state <= EXT_IDLE;
+          ext_rd_addr <= {BUFFER_WIDTH_PSUM{1'b0}};
+          psum_result_rd_valid_o <= 1'b0;
+          psum_result_rd_data_o <= {DATA_PSUM_BITWIDTH{1'b0}};
+      end else begin
+          psum_result_rd_valid_o <= 1'b0;
+
+          case (ext_rd_state)
+              EXT_IDLE: begin
+                  if (psum_result_rd_req_i &&
+                      psum_result_rd_ready_o) begin
+
+                      ext_rd_addr <=
+                          ({{(BUFFER_WIDTH_PSUM-4){1'b0}},
+                            psum_result_rd_page_i} << 5)
+                          + psum_result_rd_feature_i;
+
+                      ext_rd_state <= EXT_RAM_READ;
+                  end
+              end
+
+              EXT_RAM_READ:
+                  ext_rd_state <= EXT_PIPE_WAIT;
+
+              EXT_PIPE_WAIT:
+                  ext_rd_state <= EXT_CAPTURE;
+
+              EXT_CAPTURE: begin
+                  psum_result_rd_data_o <=
+                      psum_buffer_data_r[0+:DATA_PSUM_BITWIDTH];
+
+                  psum_result_rd_valid_o <= 1'b1;
+                  ext_rd_state <= EXT_IDLE;
+              end
+
+              default:
+                  ext_rd_state <= EXT_IDLE;
+          endcase
+      end
+  end
 
   RST_SYNC rst_sync_wrapper (
       .clk_i (clk_i),
@@ -2989,9 +3072,45 @@ end
               .Pipelined(1)
           ) psum_buffer (
               .clk_i  (clk_i),
-              .rd_en_i(psum_buffer_en_r[i_gen*((NUM_GLB_PSUM+1)/2)+j_gen*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)+g_gen] & !psum_buffer_en_w[i_gen*((NUM_GLB_PSUM+1)/2)+j_gen*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)+g_gen]),
-              .wr_en_i(psum_buffer_en_w[i_gen*((NUM_GLB_PSUM+1)/2)+j_gen*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)+g_gen]),
-              .addr_i (psum_buffer_addr[i_gen*BUFFER_WIDTH_PSUM*((NUM_GLB_PSUM+1)/2)+j_gen*BUFFER_WIDTH_PSUM*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)+g_gen*BUFFER_WIDTH_PSUM+:BUFFER_WIDTH_PSUM]),
+              .rd_en_i(
+                ext_rd_active
+                ? ((i_gen == 0) && (j_gen == 0) && (g_gen == 0))
+                : (
+                    psum_buffer_en_r[
+                        i_gen*((NUM_GLB_PSUM+1)/2)
+                        + j_gen*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)
+                        + g_gen
+                    ]
+                    &
+                    !psum_buffer_en_w[
+                        i_gen*((NUM_GLB_PSUM+1)/2)
+                        + j_gen*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)
+                        + g_gen
+                    ]
+                )
+              ),
+              .wr_en_i(
+                  ext_rd_active
+                  ? 1'b0
+                  : psum_buffer_en_w[
+                      i_gen*((NUM_GLB_PSUM+1)/2)
+                      + j_gen*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)
+                      + g_gen
+                  ]
+              ),
+              .addr_i(
+                  ext_rd_active
+                  ? ext_rd_addr
+                  : (
+                      psum_buffer_addr[
+                          i_gen*BUFFER_WIDTH_PSUM*((NUM_GLB_PSUM+1)/2)
+                          + j_gen*BUFFER_WIDTH_PSUM*CLUSTER_COLUMNS*((NUM_GLB_PSUM+1)/2)
+                          + g_gen*BUFFER_WIDTH_PSUM
+                          +: BUFFER_WIDTH_PSUM
+                      ]
+                      + psum_page_offset
+                  )
+              ),
               // The data buses are declared in TRANS_BITWIDTH_PSUM units
               // (TRANS_BITWIDTH_PSUM*CLUSTERS*NUM_GLB_PSUM), so the per-column
               // and per-row strides stay in those units. Only the slot inside

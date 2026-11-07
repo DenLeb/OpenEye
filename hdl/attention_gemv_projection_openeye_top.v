@@ -74,7 +74,15 @@ module attention_projection_openeye_top #(
     output wire [6:0] k_shift_o,
 
     // Debug address
-    output wire [ADDR_WIDTH-1:0] stream_addr_o
+    output wire [ADDR_WIDTH-1:0] stream_addr_o,
+
+    input wire psum_result_rd_req_i,
+    input wire [3:0] psum_result_rd_page_i,
+    input wire [2:0] psum_result_rd_feature_i,
+
+    output wire psum_result_rd_ready_o,
+    output wire psum_result_rd_valid_o,
+    output wire [19:0] psum_result_rd_data_o
 );
 
     //==========================================================
@@ -95,7 +103,11 @@ module attention_projection_openeye_top #(
     wire projection_start;
     wire quant_start;
 
-    assign projection_start = start_i && !quant_busy_o;
+    assign projection_start =
+        start_i &&
+        !quant_busy_o &&
+        psum_core_rd_ready &&
+        !psum_result_rd_req_i;
 
     assign quant_start =
         quant_start_i &&
@@ -256,12 +268,53 @@ module attention_projection_openeye_top #(
         .q_shift_o (q_shift_o),
         .k_shift_o (k_shift_o)
     );
-    
+
+    reg [1:0] psum_token_reg;
+    reg [1:0] psum_projection_reg;
+
+    always @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            psum_token_reg <= 2'd0;
+            psum_projection_reg <= 2'd0;
+        end else if (projection_start) begin
+            psum_token_reg <= token_select_i;
+            psum_projection_reg <= projection_select_i;
+        end
+    end
+
+    wire [3:0] psum_page = {
+        psum_projection_reg,
+        psum_token_reg
+    };
+
     //==========================================================
     // Real OpenEye accelerator
     //==========================================================
 
-    OpenEye_FPGA u_openeye (
+    wire psum_core_rd_ready;
+
+    wire psum_reader_allowed =
+        !busy_o &&
+        !adapter_busy_o &&
+        !start_i &&
+        !quant_busy_o;
+
+    assign psum_result_rd_ready_o =
+        psum_core_rd_ready && psum_reader_allowed;
+
+    OpenEye_FPGA #(
+        .ATTENTION_PSUM_ENABLE(1)
+    ) u_openeye (
+
+        .attention_mode_i(1'b1),
+        .psum_page_i(psum_page),
+
+        .psum_result_rd_req_i(psum_result_rd_req_i && psum_reader_allowed),
+        .psum_result_rd_page_i(psum_result_rd_page_i),
+        .psum_result_rd_feature_i(psum_result_rd_feature_i),
+        .psum_result_rd_ready_o(psum_core_rd_ready),
+        .psum_result_rd_valid_o(psum_result_rd_valid_o),
+        .psum_result_rd_data_o(psum_result_rd_data_o),
 
         .clk_i  (clk_i),
         .rst_ni (rst_ni),
