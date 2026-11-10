@@ -15,7 +15,7 @@ import numpy as np
 from cocotb.clock import Clock
 from cocotb.triggers import FallingEdge, RisingEdge, Timer
 
-STREAM_WORDS = 942
+STREAM_WORDS = 939
 OUTPUT_BEATS = 32
 FEATURES = 8
 PAGE_STRIDE = 32
@@ -204,7 +204,7 @@ async def run_gemv(dut, data_dir, kind, projection, token, page, expected):
 @cocotb.test()
 async def all_twelve_qkv_pages_read_via_handshake(dut):
     data_dir = Path(os.environ.get('PSUM_DIRECT_READ_DATA_DIR',
-        str(Path(__file__).resolve().parent / 'data' / 'attention_mapper_v1_fixed')))
+        str(Path(__file__).resolve().parent / 'data' / 'attention_mapper_stable_psum')))
     with np.load(data_dir / 'inputs_used.npz') as tensors:
         x = tensors['X'].astype(np.int64)
         matrices = {

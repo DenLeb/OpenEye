@@ -8,7 +8,7 @@ This version expects that you manually edited these TWO RTL sources:
   hdl/OpenEye_FPGA.v
   hdl/attention_gemv_projection_openeye_top.v
 No Python patcher is needed or imported. The test temporarily stages only the
-ROM_DEPTH=942 and STATUS_WORDS=22 compatibility adjustments for the DMA stream.
+ROM_DEPTH=939 and STATUS_WORDS=19 compatibility adjustments for the DMA stream.
 """
 import json
 import os
@@ -21,24 +21,6 @@ from open_eye import hdl_dir
 from open_eye import generator
 from open_eye import test_utils_main as ptu
 from open_eye import vh_file_creator as vh_creator
-
-
-def once(text, needle, replacement, name):
-    n = text.count(needle)
-    if n != 1:
-        raise AssertionError(f"{name}: expected one anchor, found {n}: {needle[:90]}")
-    return text.replace(needle, replacement, 1)
-
-
-
-def patch_top_for_942_stream(source: str) -> str:
-    # The 942-beat status/ROM layout fix remains in this test harness, not in
-    # the production PSUM integration patch. Its migration is a separate task.
-    if 'parameter integer ROM_DEPTH  = 939' in source:
-        source = once(source, 'parameter integer ROM_DEPTH  = 939',
-                      'parameter integer ROM_DEPTH  = 942', '942-word ROM')
-    return source
-
 
 def test_psum_integrated_rtl():
     root = Path(__file__).resolve().parents[2]
@@ -61,13 +43,13 @@ def test_psum_integrated_rtl():
     generator.create_regmap_params_vh_file(
         str(regmap_dir), str(build_dir), str(build_dir))
 
-    source_dir = test_dir / 'data' / 'attention_mapper_v1_fixed'
+    source_dir = test_dir /  'data' / 'attention_mapper_stable_psum'
     manifest = json.loads((source_dir / 'manifest.json').read_text(encoding='utf-8'))
     sections = manifest['sections']
     status = int(sections['status']['words'])
     total = int(manifest['complete_stream_words'])
     cfg = generator.regmap_transmissions(str(regmap_dir))
-    if (cfg, status, total) != (17, 22, 942):
+    if (cfg, status, total) != (14, 19, 939):
         raise AssertionError(f'Unexpected config/status/total: {cfg}/{status}/{total}')
     if sum(int(v['words']) for v in sections.values()) != total:
         raise AssertionError('Stream manifest total does not equal section sum')
@@ -82,7 +64,7 @@ def test_psum_integrated_rtl():
         if regs[key] != v:
             raise AssertionError(f'Invalid config: {key}={regs[key]}, expected {v}')
 
-    # All 12 images must exist, share one 942-word stream layout, and use
+    # All 12 images must exist, share one 939-word stream layout, and use
     # distinct activation/weight selections as declared in the manifest.
     expected_operations = [f'{kind}_t{token}' for kind in ('q', 'k', 'v')
                            for token in range(4)]
@@ -92,12 +74,12 @@ def test_psum_integrated_rtl():
     if manifest['shape']['sequence_length'] != 4 or manifest['shape']['embedding_width'] != 8:
         raise AssertionError(f"Unexpected input shape: {manifest['shape']}")
     for operation in manifest['operations']:
-        if int(operation['dma_words']) != 942:
+        if int(operation['dma_words']) != 939:
             raise AssertionError(f'Wrong DMA length: {operation}')
         stream_path = source_dir / 'verification_streams' / (operation['name'] + '.mem')
         nwords = sum(bool(line.strip()) for line in stream_path.read_text().splitlines())
-        if nwords != 942:
-            raise AssertionError(f'{stream_path}: expected 942 words, got {nwords}')
+        if nwords != 939:
+            raise AssertionError(f'{stream_path}: expected 939 words, got {nwords}')
     if not (source_dir / 'inputs_used.npz').is_file():
         raise FileNotFoundError(source_dir / 'inputs_used.npz')
 
@@ -116,33 +98,20 @@ def test_psum_integrated_rtl():
     for name in ('common_rom.mem', 'activation_ram.mem', 'weight_ram.mem'):
         shutil.copyfile(source_dir / name, build_dir / name)
 
-    replacements = {
-        'attention_projection_memory.v': lambda text: once(text,
-            'parameter integer STATUS_WORDS       = 19,',
-            'parameter integer STATUS_WORDS       = 22,', 'memory status size'),
-        'attention_gemv_projection_openeye_top.v': patch_top_for_942_stream,
-    }
-    sources = []
-    patched = set()
-    for file in ptu.get_verilog_sources(str(hdl_dir)):
-        path = Path(file)
-        if path.name == 'dma_storage.v':
-            continue
-        if path.name in replacements:
-            staged = build_dir / path.name
-            original = path.read_text(encoding='utf-8')
-            changed = replacements[path.name](original)
-            if changed == original and path.name == 'attention_projection_memory.v':
-                raise AssertionError(f'Staging made no change to {path.name}')
-            staged.write_text(changed, encoding='utf-8')
-            sources.append(str(staged))
-            patched.add(path.name)
-        else:
-            sources.append(file)
-    if patched != set(replacements):
-        raise AssertionError(f'Not all required RTL files found: {set(replacements) - patched}')
+    sources = [
+        str(file)
+        for file in ptu.get_verilog_sources(str(hdl_dir))
+        if Path(file).name != 'dma_storage.v'
+    ]
+
     sources.append(str(build_dir / 'dma_storage.v'))
-    print('PSUM MANUAL RTL: using your manually edited OpenEye_FPGA.v and projection top + staged 942-stream test config.', flush=True)
+
+    print(
+        'PSUM INTEGRATION: Stable configuration, '
+        '939-word DMA stream.',
+        flush=True
+    )
+    print('PSUM INTEGRATION: Stable configuration, 939-word DMA stream, no temporary RTL patch.',flush=True)
     print('PSUM INTEGRATION: RAM_SP is unchanged and remains single-port.', flush=True)
     print('PSUM INTEGRATION: Q pages 0..3; K pages 4..7; V pages 8..11 (stride=32).', flush=True)
 

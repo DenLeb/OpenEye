@@ -116,38 +116,23 @@ class AttentionProjectionMapper:
         w_pad = np.zeros((self.n_pad, self.k_pad), dtype=np.int64)
         w_pad[:n, :k] = weights_out_in
 
-
         layer = _layer_shim(self.k_pad, self.n_pad)
-
-        rel_layers = {
-            "Next_Layer": {layer.name: []},
-            "Previous_Layer": {layer.name: ["input_layer"]},
-        }
-
-        layer_params = lp.LayerParameters(
-            {}, layer, self.params, rel_layers, 0
-        )
-
+        layer_params = lp.LayerParameters([0], layer, self.params, 0, 1)
         if layer_params.needed_total_transmissions != 1:
-            raise ValueError(
-                "Only a one-repetition GEMV mapping is supported"
-            )
-
+            raise ValueError("Only a one-repetition GEMV mapping is supported by this baseline")
+        # No unverified OpenEye weight/activation reuse at this stage.
         layer_params.skipIact = 0
         layer_params.skipWght = 0
         layer_params.skipPsum = 0
-        layer_params.send_values_out = 1
+        layer_params.send_values_out = 1  # Raw PSUM output via DMA.
 
-        content = [
-            [act_pad.tolist()],
-            w_pad.tolist(),
-            [0] * self.n_pad,
-        ]
+        dram = DRAM.DRAMContents([layer], [layer_params])
+        dram.fmap[0] = act_pad.tolist()
+        dram.weights[0] = w_pad.tolist()
+        dram.bias[0] = [0] * self.n_pad
+        content = [dram.fmap[0], dram.weights[0], dram.bias[0]]
 
-        mapper = DenseMapper(
-            self.params, layer_params, 0, content, 0, 0
-        )
-
+        mapper = DenseMapper(self.params, layer_params, 0, content, 0, 0)
         mapper.make_stream()
         raw = mapper.get_stream()
         if any(getattr(layer_params, key) != 0 for key in ("skipIact", "skipWght", "skipPsum")):

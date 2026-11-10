@@ -1,0 +1,119 @@
+{
+  "scope": "Q/K/V projection only; 12 sequential GEMV passes via existing gemm_mode=0",
+  "skip_flags": {
+    "skipIact": 0,
+    "skipWght": 0,
+    "skipPsum": 0
+  },
+  "precision": "signed INT8 operands / raw PSUM output",
+  "shape": {
+    "sequence_length": 4,
+    "embedding_width": 8,
+    "padded_k": 32,
+    "padded_n": 32
+  },
+  "dma_word_bits": 64,
+  "complete_stream_words": 939,
+  "sections": {
+    "status": {
+      "start": 0,
+      "words": 19
+    },
+    "iact": {
+      "start": 19,
+      "words": 8
+    },
+    "wght": {
+      "start": 27,
+      "words": 240
+    },
+    "psum": {
+      "start": 267,
+      "words": 32
+    },
+    "quantize": {
+      "start": 299,
+      "words": 640
+    }
+  },
+  "memories": {
+    "common_rom_words": 691,
+    "activation_ram_words": 32,
+    "weight_ram_words": 720
+  },
+  "operations": [
+    {
+      "name": "q_t0",
+      "activation_base_word": 0,
+      "weight_base_word": 0,
+      "dma_words": 939
+    },
+    {
+      "name": "q_t1",
+      "activation_base_word": 8,
+      "weight_base_word": 0,
+      "dma_words": 939
+    },
+    {
+      "name": "q_t2",
+      "activation_base_word": 16,
+      "weight_base_word": 0,
+      "dma_words": 939
+    },
+    {
+      "name": "q_t3",
+      "activation_base_word": 24,
+      "weight_base_word": 0,
+      "dma_words": 939
+    },
+    {
+      "name": "k_t0",
+      "activation_base_word": 0,
+      "weight_base_word": 240,
+      "dma_words": 939
+    },
+    {
+      "name": "k_t1",
+      "activation_base_word": 8,
+      "weight_base_word": 240,
+      "dma_words": 939
+    },
+    {
+      "name": "k_t2",
+      "activation_base_word": 16,
+      "weight_base_word": 240,
+      "dma_words": 939
+    },
+    {
+      "name": "k_t3",
+      "activation_base_word": 24,
+      "weight_base_word": 240,
+      "dma_words": 939
+    },
+    {
+      "name": "v_t0",
+      "activation_base_word": 0,
+      "weight_base_word": 480,
+      "dma_words": 939
+    },
+    {
+      "name": "v_t1",
+      "activation_base_word": 8,
+      "weight_base_word": 480,
+      "dma_words": 939
+    },
+    {
+      "name": "v_t2",
+      "activation_base_word": 16,
+      "weight_base_word": 480,
+      "dma_words": 939
+    },
+    {
+      "name": "v_t3",
+      "activation_base_word": 24,
+      "weight_base_word": 480,
+      "dma_words": 939
+    }
+  ],
+  "caveat": "Bit-exact Python stream reconstruction checked, NOT yet RTL/DUT-verified. RAM contents are initialization images; writable hardware is a separate RTL step."
+}
