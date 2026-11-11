@@ -20,10 +20,11 @@
 //   - Projection: 939 DMA words
 //   - QKT: 677 DMA words
 //
-// Softmax is excluded.
+// Stage 4 includes Softmax; earlier stages compile it out.
 //=============================================================================
 
 module attention_top #(
+    parameter integer INTEGRATION_STAGE = 4,
     parameter integer DMA_WIDTH = 64,
     parameter integer ADDR_WIDTH = 16,
     parameter integer PROJECTION_STREAM_WORDS = 939,
@@ -47,6 +48,14 @@ module attention_top #(
     input  wire                  wght_we_i,
     input  wire [ADDR_WIDTH-1:0] wght_wr_addr_i,
     input  wire [DMA_WIDTH-1:0]  wght_wr_data_i,
+
+    // Synthesis-visible readback; use after busy_o deasserts.
+    // observe_select_i: 0=Q raw, 1=K raw, 2=V raw,
+    //                   3=Q8, 4=K8, 5=Q shift, 6=K shift.
+    input  wire [2:0] observe_select_i,
+    input  wire [1:0] observe_token_i,
+    input  wire [2:0] observe_feature_i,
+    output reg  [19:0] observe_data_o,
 
     // Read the final 4x4 QK^T scores; used later by Softmax.
     input  wire [1:0] score_rd_token_i,
@@ -104,7 +113,9 @@ module attention_top #(
     wire [1:0] selected_score_rd_token;
     wire [1:0] selected_score_rd_index;
 
-    attention_top_scheduler u_scheduler (
+    attention_top_scheduler #(
+        .INTEGRATION_STAGE(INTEGRATION_STAGE)
+    ) u_scheduler (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
         .start_i(start_i),
@@ -238,12 +249,12 @@ module attention_top #(
         .result_write_i(result_write && !qkt_mode),
         .result_addr_i(result_addr),
         .result_data_i(result_data),
-        .q_rd_token_i(quant_q_rd_token),
-        .q_rd_feature_i(quant_q_rd_feature),
-        .k_rd_token_i(quant_k_rd_token),
-        .k_rd_feature_i(quant_k_rd_feature),
-        .v_rd_token_i(2'd0),
-        .v_rd_feature_i(3'd0),
+        .q_rd_token_i(quant_busy ? quant_q_rd_token : observe_token_i),
+        .q_rd_feature_i(quant_busy ? quant_q_rd_feature : observe_feature_i),
+        .k_rd_token_i(quant_busy ? quant_k_rd_token : observe_token_i),
+        .k_rd_feature_i(quant_busy ? quant_k_rd_feature : observe_feature_i),
+        .v_rd_token_i(observe_token_i),
+        .v_rd_feature_i(observe_feature_i),
         .q_data_o(q_raw_data),
         .k_data_o(k_raw_data),
         .v_data_o(v_raw_data)
@@ -259,8 +270,23 @@ module attention_top #(
     wire [6:0] q_shift;
     wire [6:0] k_shift;
 
-    attention_qk_quantization_controller #(
-        .NUM_TOKENS(4),
+    // Q8/K8 read ports are shared by the packers and the observation path.
+    wire [1:0] packer_q8_rd_token;
+    wire [2:0] packer_q8_rd_feature;
+    wire [1:0] packer_k8_rd_token;
+    wire [2:0] packer_k8_rd_feature;
+    wire q8_packer_busy;
+    wire k8_packer_busy;
+
+    assign q8_rd_token   = q8_packer_busy ? packer_q8_rd_token : observe_token_i;
+    assign q8_rd_feature = q8_packer_busy ? packer_q8_rd_feature : observe_feature_i;
+    assign k8_rd_token   = k8_packer_busy ? packer_k8_rd_token : observe_token_i;
+    assign k8_rd_feature = k8_packer_busy ? packer_k8_rd_feature : observe_feature_i;
+
+    generate
+        if (INTEGRATION_STAGE >= 2) begin : GEN_QUANTIZATION
+            attention_qk_quantization_controller #(
+                .NUM_TOKENS(4),
         .NUM_FEATURES(8),
         .DATA_WIDTH(20),
         .SHIFT_WIDTH(7)
@@ -284,22 +310,57 @@ module attention_top #(
         .k8_data_o(k8_data),
         .q_shift_o(q_shift),
         .k_shift_o(k_shift)
-    );
+            );
+        end else begin : GEN_NO_QUANTIZATION
+            assign quant_busy = 1'b0;
+            assign quant_done = 1'b0;
+            assign quant_q_rd_token = 2'd0;
+            assign quant_q_rd_feature = 3'd0;
+            assign quant_k_rd_token = 2'd0;
+            assign quant_k_rd_feature = 3'd0;
+            assign q8_data = 8'sd0;
+            assign k8_data = 8'sd0;
+            assign q_shift = 7'd0;
+            assign k_shift = 7'd0;
+        end
+    endgenerate
 
+    // Intermediate-value observation keeps stage-specific buffers measurable.
+    always @(*) begin
+        case (observe_select_i)
+            3'd0: observe_data_o = q_raw_data;
+            3'd1: observe_data_o = k_raw_data;
+            3'd2: observe_data_o = v_raw_data;
+            3'd3: observe_data_o = {{12{q8_data[7]}}, q8_data};
+            3'd4: observe_data_o = {{12{k8_data[7]}}, k8_data};
+            3'd5: observe_data_o = {13'd0, q_shift};
+            3'd6: observe_data_o = {13'd0, k_shift};
+            default: observe_data_o = 20'd0;
+        endcase
+    end
+
+    // Shared Score Buffer read interface across all configurations.
+    assign selected_score_rd_token =
+        softmax_busy ? softmax_score_rd_token : score_rd_token_i;
+    assign selected_score_rd_index =
+        softmax_busy ? softmax_score_rd_index : score_rd_index_i;
+    assign score_rd_data_o = score_buffer_rd_data;
+    assign score_rd_valid_o = score_buffer_rd_valid;
+
+    generate
+        if (INTEGRATION_STAGE >= 3) begin : GEN_QKT
     //===================== QKT DMA OPERAND PACKERS ===========================
     wire [DMA_WIDTH-1:0] q8_word;
     wire q8_word_valid;
     wire q8_word_ready;
     wire q8_word_last;
     wire q8_word_index;
-    wire q8_packer_busy;
     wire q8_packer_done;
     wire [DMA_WIDTH-1:0] k8_word;
     wire k8_word_valid;
     wire k8_word_ready;
     wire k8_word_last;
     wire [3:0] k8_word_index;
-    wire k8_packer_busy;
     wire k8_packer_done;
 
     // NOTE: Verify exact port names/widths against the local passing
@@ -309,8 +370,8 @@ module attention_top #(
         .rst_ni(rst_ni),
         .start_i(q8_packer_start),
         .token_i(token_select),
-        .q8_rd_token_o(q8_rd_token),
-        .q8_rd_feature_o(q8_rd_feature),
+        .q8_rd_token_o(packer_q8_rd_token),
+        .q8_rd_feature_o(packer_q8_rd_feature),
         .q8_data_i(q8_data),
         .q8_word_o(q8_word),
         .q8_word_valid_o(q8_word_valid),
@@ -325,8 +386,8 @@ module attention_top #(
         .clk_i(clk_i),
         .rst_ni(rst_ni),
         .start_i(k8_packer_start),
-        .k8_rd_token_o(k8_rd_token),
-        .k8_rd_feature_o(k8_rd_feature),
+        .k8_rd_token_o(packer_k8_rd_token),
+        .k8_rd_feature_o(packer_k8_rd_feature),
         .k8_data_i(k8_data),
         .wght_word_o(k8_word),
         .wght_word_valid_o(k8_word_valid),
@@ -364,18 +425,7 @@ module attention_top #(
     // OpenEye K8/N4 row-stationary output DMA beat order = 0, 2, 1, 3.
     wire [1:0] mapped_score_index = {result_addr[0], result_addr[1]};
     wire score_write = qkt_result_enable && result_write && (result_addr < 4);
-
-    assign selected_score_rd_token =
-    softmax_busy ? softmax_score_rd_token
-                 : score_rd_token_i;
-
-    assign selected_score_rd_index =
-    softmax_busy ? softmax_score_rd_index
-                 : score_rd_index_i;
-
-    assign score_rd_data_o  = score_buffer_rd_data;
-    assign score_rd_valid_o = score_buffer_rd_valid;
-
+    
     attention_qkt_score_buffer #(
         .NUM_TOKENS(4),
         .NUM_SCORES(4),
@@ -394,10 +444,25 @@ module attention_top #(
         .read_valid_o(score_buffer_rd_valid),
         .complete_o(scores_complete_o)
     );
+        end else begin : GEN_NO_QKT
+            assign packer_q8_rd_token = 2'd0;
+            assign packer_q8_rd_feature = 3'd0;
+            assign packer_k8_rd_token = 2'd0;
+            assign packer_k8_rd_feature = 3'd0;
+            assign q8_packer_busy = 1'b0;
+            assign k8_packer_busy = 1'b0;
+            assign qkt_stream_data = {DMA_WIDTH{1'b0}};
+            assign operands_ready = 1'b0;
+            assign score_buffer_rd_data = 20'sd0;
+            assign score_buffer_rd_valid = 1'b0;
+            assign scores_complete_o = 1'b0;
+        end
+    endgenerate
 
-    
     //===================== ATTENTION SOFTMAX ===============================
 
+    generate
+        if (INTEGRATION_STAGE == 4) begin : GEN_SOFTMAX
     attention_softmax u_softmax (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
@@ -424,9 +489,21 @@ module attention_top #(
         .done_o(softmax_done),
         .complete_o(softmax_complete_o)
     );
+        end else begin : GEN_NO_SOFTMAX
+            assign softmax_score_rd_token = 2'd0;
+            assign softmax_score_rd_index = 2'd0;
+            assign softmax_busy = 1'b0;
+            assign softmax_done = 1'b0;
+            assign softmax_complete_o = 1'b0;
+            assign prob_rd_data_o = 16'd0;
+            assign prob_rd_valid_o = 1'b0;
+        end
+    endgenerate
 
 `ifndef SYNTHESIS
     initial begin
+        if (INTEGRATION_STAGE < 1 || INTEGRATION_STAGE > 4)
+            $fatal(1, "INTEGRATION_STAGE must be between 1 and 4");
         if (DMA_WIDTH != 64 || ADDR_WIDTH != 16 ||
             PROJECTION_STREAM_WORDS != 939 || QKT_STREAM_WORDS != 677)
             $fatal(1, "attention_top: unverified geometry or DMA configuration");

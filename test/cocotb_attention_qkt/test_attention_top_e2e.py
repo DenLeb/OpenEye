@@ -13,6 +13,7 @@ all of that. Python is used for the independent arithmetic golden reference.
 
 import os
 import shutil
+import pytest
 from pathlib import Path
 
 import cocotb
@@ -21,7 +22,14 @@ from cocotb.clock import Clock
 from cocotb.triggers import FallingEdge, RisingEdge, Timer, with_timeout, SimTimeoutError
 
 
-def test_attention_top_e2e():
+@pytest.mark.parametrize(
+    "stage, test_case",
+    [
+        (4, "check_complete_attention_dataflow"),
+        (1, "check_stage1_projection"),
+    ],
+)
+def test_attention_top_e2e(stage, test_case):
     import cocotb_test.simulator
     import open_eye.test_utils_main as ptu
     import open_eye.vh_file_creator as vh_file_creator
@@ -62,7 +70,7 @@ def test_attention_top_e2e():
     }
     os.environ.update(settings)
 
-    build = Path(test_dir) / ".temp" / "attention_top_e2e_k8_n4"
+    build = (Path(test_dir)/ ".temp"/ f"attention_top_e2e_k8_n4_stage{stage}")
     build.mkdir(parents=True, exist_ok=True)
     vh_file_creator.create_vh_file_from_envvars(
         str(build), str(hdl_dir) + os.sep, toplevel="OpenEye_FPGA"
@@ -106,7 +114,7 @@ def test_attention_top_e2e():
         verilog_sources=sources,
         toplevel="attention_top",
         module="test_attention_top_e2e",
-        testcase="check_complete_attention_dataflow",
+        parameters={"INTEGRATION_STAGE": stage},
         sim_build=str(build),
         includes=[str(build), str(hdl_dir), str(Path(hdl_dir) / "include")],
         defines={"NO_TRACE": "TRUE", "USE_INTERNAL_PARAMS_PE": "TRUE"},
@@ -116,9 +124,199 @@ def test_attention_top_e2e():
         extra_env={
             **settings,
             "ATTENTION_E2E_PROJECTION_DIR": str(proj_dir.resolve()),
+            "COCOTB_TEST_FILTER": f"{test_case}$",
         },
     )
 
+
+@cocotb.test()
+async def check_stage1_projection(dut):
+    projection_dir = Path(
+        os.environ["ATTENTION_E2E_PROJECTION_DIR"]
+    )
+
+    # Independent mathematical reference
+    with np.load(
+        projection_dir / "inputs_used.npz",
+        allow_pickle=False
+    ) as data:
+        x = data["X"].astype(np.int64)
+        wq = data["WQ"].astype(np.int64)
+        wk = data["WK"].astype(np.int64)
+        wv = data["WV"].astype(np.int64)
+
+    golden = [
+        x @ wq,
+        x @ wk,
+        x @ wv,
+    ]
+
+    for matrix in golden:
+        assert matrix.shape == (4, 8)
+
+    # Initialize all top-level inputs
+    dut.rst_ni.value = 0
+    dut.start_i.value = 0
+
+    dut.iact_we_i.value = 0
+    dut.iact_wr_addr_i.value = 0
+    dut.iact_wr_data_i.value = 0
+
+    dut.wght_we_i.value = 0
+    dut.wght_wr_addr_i.value = 0
+    dut.wght_wr_data_i.value = 0
+
+    dut.observe_select_i.value = 0
+    dut.observe_token_i.value = 0
+    dut.observe_feature_i.value = 0
+
+    dut.score_rd_token_i.value = 0
+    dut.score_rd_index_i.value = 0
+
+    dut.prob_rd_token_i.value = 0
+    dut.prob_rd_index_i.value = 0
+
+    cocotb.start_soon(
+        Clock(dut.clk_i, 20, unit="ns").start()
+    )
+
+    for _ in range(12):
+        await FallingEdge(dut.clk_i)
+
+    dut.rst_ni.value = 1
+
+    for _ in range(20):
+        await FallingEdge(dut.clk_i)
+
+    # Monitor actual DMA results
+    projection_beats = 0
+    seen_projections = set()
+    qkt_beats = 0
+
+    async def monitor():
+        nonlocal projection_beats, qkt_beats
+
+        while True:
+            await FallingEdge(dut.clk_i)
+            await Timer(1, unit="ns")
+
+            if int(dut.dma_result_write_o.value):
+                mode = int(dut.qkt_mode_o.value)
+
+                if mode == 0:
+                    projection_beats += 1
+                    seen_projections.add((
+                        int(dut.active_projection_o.value),
+                        int(dut.active_token_o.value),
+                    ))
+                else:
+                    qkt_beats += 1
+
+    monitor_task = cocotb.start_soon(monitor())
+
+    dut._log.info("START: INTEGRATION_STAGE=1")
+
+    # Start one complete Projection sequence
+    await FallingEdge(dut.clk_i)
+    dut.start_i.value = 1
+
+    await FallingEdge(dut.clk_i)
+    dut.start_i.value = 0
+
+    try:
+        await with_timeout(
+            RisingEdge(dut.done_o),
+            15_000_000,
+            "ns"
+        )
+    except SimTimeoutError as exc:
+        raise AssertionError(
+            "Stage 1 timeout: "
+            f"beats={projection_beats}, "
+            f"seen={seen_projections}, "
+            f"token={dut.active_token_o.value}, "
+            f"projection={dut.active_projection_o.value}"
+        ) from exc
+
+    await FallingEdge(dut.clk_i)
+    monitor_task.cancel()
+
+    # Verify Scheduler execution
+    expected_projections = {
+        (projection, token)
+        for projection in range(3)
+        for token in range(4)
+    }
+
+    assert seen_projections == expected_projections, (
+        f"Missing projections: "
+        f"{expected_projections - seen_projections}"
+    )
+
+    assert projection_beats == 384, (
+        f"Expected 384 DMA beats, got {projection_beats}"
+    )
+
+    assert qkt_beats == 0, (
+        f"QKT must not execute in Stage 1: {qkt_beats}"
+    )
+
+    assert int(dut.busy_o.value) == 0
+    assert int(dut.qkt_mode_o.value) == 0
+
+    # Check disabled stages
+    assert int(dut.scores_complete_o.value) == 0
+    assert int(dut.score_rd_valid_o.value) == 0
+
+    assert int(dut.softmax_complete_o.value) == 0
+    assert int(dut.prob_rd_valid_o.value) == 0
+
+    # Read and compare all 96 Q/K/V values
+    def signed20(raw):
+        raw = int(raw)
+        return raw - (1 << 20) if raw & (1 << 19) else raw
+
+    names = ["Q", "K", "V"]
+
+    for select in range(3):
+        actual = np.zeros((4, 8), dtype=np.int64)
+
+        dut.observe_select_i.value = select
+
+        for token in range(4):
+            for feature in range(8):
+                dut.observe_token_i.value = token
+                dut.observe_feature_i.value = feature
+
+                await Timer(1, unit="ns")
+
+                actual[token, feature] = signed20(
+                    dut.observe_data_o.value
+                )
+
+        dut._log.info(
+            "%s expected:\n%s",
+            names[select],
+            golden[select]
+        )
+
+        dut._log.info(
+            "%s actual:\n%s",
+            names[select],
+            actual
+        )
+
+        assert np.array_equal(actual, golden[select]), (
+            f"{names[select]} projection mismatch\n"
+            f"Expected:\n{golden[select]}\n"
+            f"Actual:\n{actual}"
+        )
+
+    dut._log.info(
+        "PASS Stage 1: 12 GEMVs, 384 DMA beats, "
+        "all 96 Q/K/V values bit-exact, "
+        "no QKT or Softmax execution"
+    )
 
 def _reference_quantize(values):
     """Bit-exact per-tensor pow2 rounding from passing Q/K quantization TB."""
@@ -165,6 +363,9 @@ async def check_complete_attention_dataflow(dut):
     dut.score_rd_index_i.value = 0
     dut.prob_rd_token_i.value = 0
     dut.prob_rd_index_i.value = 0
+    dut.observe_select_i.value = 0
+    dut.observe_token_i.value = 0
+    dut.observe_feature_i.value = 0
 
     cocotb.start_soon(Clock(dut.clk_i, 20, unit="ns").start())
     for _ in range(12):
