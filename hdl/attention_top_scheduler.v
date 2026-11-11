@@ -5,7 +5,9 @@
 // 12 projection GEMVs -> quantization -> 4 QKT GEMVs -> global DONE.
 // No arithmetic, Python orchestration, second DMA adapter or second OpenEye.
 //=============================================================================
-module attention_top_scheduler (
+module attention_top_scheduler #(
+    parameter integer INTEGRATION_STAGE = 4
+)(
     input  wire clk_i,
     input  wire rst_ni,
     input  wire start_i,
@@ -63,7 +65,7 @@ module attention_top_scheduler (
     assign gemv_start_o = (state == PROJ_START) || (state == QKT_GEMV_START);
     assign qkt_result_enable_o = (state == QKT_GEMV_WAIT);
     assign softmax_start_o =
-    (state == SOFTMAX_START) && scores_complete_i;
+    (INTEGRATION_STAGE == 4) && (state == SOFTMAX_START) && scores_complete_i;
 
     always @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
@@ -94,15 +96,22 @@ module attention_top_scheduler (
                             projection <= projection + 2'd1;
                             state <= PROJ_START;
                         end else begin
-                            state <= QUANT_START;
+                            if (INTEGRATION_STAGE == 1)
+                                state <= FINISH;
+                            else
+                                state <= QUANT_START;
                         end
                     end
                 end
                 QUANT_START: state <= QUANT_WAIT;
                 QUANT_WAIT: if (quant_done_i) begin
-                    qkt_mode <= 1'b1;
-                    token <= 2'd0;
-                    state <= QKT_CLEAR;
+                    if (INTEGRATION_STAGE == 2) begin
+                        state <= FINISH;
+                    end else begin
+                        qkt_mode <= 1'b1;
+                        token <= 2'd0;
+                        state <= QKT_CLEAR;
+                    end
                 end
                 QKT_CLEAR: state <= QKT_PACK_START;
                 QKT_PACK_START: state <= QKT_PACK_WAIT;
@@ -112,7 +121,10 @@ module attention_top_scheduler (
                     if (gemv_done_i) begin
                         if (token == 2'd3) begin
                             // All four QKT GEMVs have finished.
-                            state <= SOFTMAX_START;
+                            if (INTEGRATION_STAGE == 3)
+                                state <= FINISH;
+                            else
+                                state <= SOFTMAX_START;
                         end else begin
                             token <= token + 2'd1;
                             state <= QKT_RELOAD;
