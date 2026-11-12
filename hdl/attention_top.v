@@ -193,13 +193,52 @@ module attention_top #(
         .result_addr_o(result_addr)
     );
 
+    //===================== SINGLE-PORT PSUM READ ======================
+
+    wire psum_rd_req;
+    wire [3:0] psum_rd_page;
+    wire [2:0] psum_rd_feature;
+
+    wire psum_rd_ready;
+    wire psum_rd_valid;
+    wire [19:0] psum_rd_data;
+
+    // Retain projection page during the complete GEMV operation
+    reg [3:0] psum_active_page;
+
+    always @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            psum_active_page <= 4'd0;
+        end else if (projection_start && !qkt_mode) begin
+            psum_active_page <= {projection_select, token_select};
+        end
+    end
     //===================== ONE SHARED OPENEYE ================================
-    OpenEye_FPGA u_openeye (
+    OpenEye_FPGA #(
+    .ATTENTION_PSUM_ENABLE(1)
+    ) u_openeye (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
+
+        .attention_mode_i(!qkt_mode),
+
+        .psum_page_i(psum_active_page),
+
+        .psum_result_rd_req_i(psum_rd_req),
+        .psum_result_rd_page_i(psum_rd_page),
+        .psum_result_rd_feature_i(psum_rd_feature),
+
+        // Direct PSUM read interface
+        .psum_result_rd_ready_o(psum_rd_ready),
+        .psum_result_rd_valid_o(psum_rd_valid),
+        .psum_result_rd_data_o(psum_rd_data),
+
+        // DMA input
         .data_dma_i(dma_input_data),
         .enable_dma_i(dma_input_valid),
         .ready_dma_o(dma_input_ready),
+
+        // DMA output
         .data_dma_o(dma_output_data),
         .enable_dma_o(dma_output_valid),
         .last_data_o(dma_output_last),
@@ -289,7 +328,8 @@ module attention_top #(
                 .NUM_TOKENS(4),
         .NUM_FEATURES(8),
         .DATA_WIDTH(20),
-        .SHIFT_WIDTH(7)
+        .SHIFT_WIDTH(7),
+        .PSUM_SINGLE_PORT(1)
     ) u_quantization (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
@@ -302,6 +342,13 @@ module attention_top #(
         .k_raw_rd_token_o(quant_k_rd_token),
         .k_raw_rd_feature_o(quant_k_rd_feature),
         .k_raw_data_i(k_raw_data),
+        .psum_rd_req_o(psum_rd_req),
+        .psum_rd_page_o(psum_rd_page),
+        .psum_rd_feature_o(psum_rd_feature),
+
+        .psum_rd_ready_i(psum_rd_ready),
+        .psum_rd_valid_i(psum_rd_valid),
+        .psum_rd_data_i(psum_rd_data),
         .q8_rd_token_i(q8_rd_token),
         .q8_rd_feature_i(q8_rd_feature),
         .q8_data_o(q8_data),
@@ -445,6 +492,9 @@ module attention_top #(
         .complete_o(scores_complete_o)
     );
         end else begin : GEN_NO_QKT
+            assign psum_rd_req = 1'b0;
+            assign psum_rd_page = 4'd0;
+            assign psum_rd_feature = 3'd0;
             assign packer_q8_rd_token = 2'd0;
             assign packer_q8_rd_feature = 3'd0;
             assign packer_k8_rd_token = 2'd0;
