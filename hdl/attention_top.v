@@ -25,6 +25,7 @@
 
 module attention_top #(
     parameter integer INTEGRATION_STAGE = 4,
+    parameter integer PSUM_SINGLE_PORT = 1,
     parameter integer DMA_WIDTH = 64,
     parameter integer ADDR_WIDTH = 16,
     parameter integer PROJECTION_STREAM_WORDS = 939,
@@ -56,6 +57,10 @@ module attention_top #(
     input  wire [1:0] observe_token_i,
     input  wire [2:0] observe_feature_i,
     output reg  [19:0] observe_data_o,
+
+    input  wire observe_req_i,
+    output wire observe_ready_o,
+    output reg  observe_valid_o,
 
     // Read the final 4x4 QK^T scores; used later by Softmax.
     input  wire [1:0] score_rd_token_i,
@@ -203,6 +208,20 @@ module attention_top #(
     wire psum_rd_valid;
     wire [19:0] psum_rd_data;
 
+    // Shared OpenEye PSUM read interface
+    wire core_psum_rd_req;
+    wire [3:0] core_psum_rd_page;
+    wire [2:0] core_psum_rd_feature;
+
+    wire core_psum_rd_ready;
+    wire core_psum_rd_valid;
+    wire [19:0] core_psum_rd_data;
+
+    // Quantization receives the existing OpenEye response.
+    assign psum_rd_ready = core_psum_rd_ready;
+    assign psum_rd_valid = core_psum_rd_valid;
+    assign psum_rd_data  = core_psum_rd_data;
+
     // Retain projection page during the complete GEMV operation
     reg [3:0] psum_active_page;
 
@@ -213,6 +232,108 @@ module attention_top #(
             psum_active_page <= {projection_select, token_select};
         end
     end
+    //===================== QUANTIZATION SIGNALS ========================
+
+    wire quant_busy;
+
+    // Legacy RAW Q/K read interface
+    wire [1:0] quant_q_rd_token;
+    wire [2:0] quant_q_rd_feature;
+    wire [1:0] quant_k_rd_token;
+    wire [2:0] quant_k_rd_feature;
+
+    wire [19:0] q_raw_data;
+    wire [19:0] k_raw_data;
+    wire [19:0] v_raw_data;
+
+    // Quantized Q8/K8 read interface
+    wire [1:0] q8_rd_token;
+    wire [2:0] q8_rd_feature;
+    wire signed [7:0] q8_data;
+
+    wire [1:0] k8_rd_token;
+    wire [2:0] k8_rd_feature;
+    wire signed [7:0] k8_data;
+
+    // Quantization shift values
+    wire [6:0] q_shift;
+    wire [6:0] k_shift;
+    //===================== Q/K QUANTIZATION ===========================
+
+generate
+    if (INTEGRATION_STAGE >= 2) begin : GEN_QUANTIZATION
+
+        attention_qk_quantization_controller #(
+            .NUM_TOKENS(4),
+            .NUM_FEATURES(8),
+            .DATA_WIDTH(20),
+            .SHIFT_WIDTH(7),
+            .PSUM_SINGLE_PORT(PSUM_SINGLE_PORT)
+        ) u_quantization (
+
+            .clk_i(clk_i),
+            .rst_ni(rst_ni),
+
+            .start_i(quant_start),
+            .busy_o(quant_busy),
+            .done_o(quant_done),
+
+            // Legacy RAW Q
+            .q_raw_rd_token_o(quant_q_rd_token),
+            .q_raw_rd_feature_o(quant_q_rd_feature),
+            .q_raw_data_i(q_raw_data),
+
+            // Legacy RAW K
+            .k_raw_rd_token_o(quant_k_rd_token),
+            .k_raw_rd_feature_o(quant_k_rd_feature),
+            .k_raw_data_i(k_raw_data),
+
+            // Direct Single-Port PSUM
+            .psum_rd_req_o(psum_rd_req),
+            .psum_rd_page_o(psum_rd_page),
+            .psum_rd_feature_o(psum_rd_feature),
+
+            .psum_rd_ready_i(psum_rd_ready),
+            .psum_rd_valid_i(psum_rd_valid),
+            .psum_rd_data_i(psum_rd_data),
+
+            // Quantized Q8
+            .q8_rd_token_i(q8_rd_token),
+            .q8_rd_feature_i(q8_rd_feature),
+            .q8_data_o(q8_data),
+
+            // Quantized K8
+            .k8_rd_token_i(k8_rd_token),
+            .k8_rd_feature_i(k8_rd_feature),
+            .k8_data_o(k8_data),
+
+            // Scaling
+            .q_shift_o(q_shift),
+            .k_shift_o(k_shift)
+        );
+
+    end else begin : GEN_NO_QUANTIZATION
+
+        assign quant_busy = 1'b0;
+        assign quant_done = 1'b0;
+
+        assign quant_q_rd_token = 2'd0;
+        assign quant_q_rd_feature = 3'd0;
+        assign quant_k_rd_token = 2'd0;
+        assign quant_k_rd_feature = 3'd0;
+
+        assign psum_rd_req = 1'b0;
+        assign psum_rd_page = 4'd0;
+        assign psum_rd_feature = 3'd0;
+
+        assign q8_data = 8'sd0;
+        assign k8_data = 8'sd0;
+
+        assign q_shift = 7'd0;
+        assign k_shift = 7'd0;
+
+    end
+endgenerate
     //===================== ONE SHARED OPENEYE ================================
     OpenEye_FPGA #(
     .ATTENTION_PSUM_ENABLE(1)
@@ -220,18 +341,16 @@ module attention_top #(
         .clk_i(clk_i),
         .rst_ni(rst_ni),
 
-        .attention_mode_i(!qkt_mode),
-
+        .attention_mode_i(!qkt_mode || !busy_o),
         .psum_page_i(psum_active_page),
 
-        .psum_result_rd_req_i(psum_rd_req),
-        .psum_result_rd_page_i(psum_rd_page),
-        .psum_result_rd_feature_i(psum_rd_feature),
+        .psum_result_rd_req_i(core_psum_rd_req),
+        .psum_result_rd_page_i(core_psum_rd_page),
+        .psum_result_rd_feature_i(core_psum_rd_feature),
 
-        // Direct PSUM read interface
-        .psum_result_rd_ready_o(psum_rd_ready),
-        .psum_result_rd_valid_o(psum_rd_valid),
-        .psum_result_rd_data_o(psum_rd_data),
+        .psum_result_rd_ready_o(core_psum_rd_ready),
+        .psum_result_rd_valid_o(core_psum_rd_valid),
+        .psum_result_rd_data_o(core_psum_rd_data),
 
         // DMA input
         .data_dma_i(dma_input_data),
@@ -269,46 +388,6 @@ module attention_top #(
         .wght_wr_data_i(wght_wr_data_i)
     );
 
-    //===================== Q/K/V RAW RESULT STORAGE ==========================
-    wire [1:0] quant_q_rd_token;
-    wire [2:0] quant_q_rd_feature;
-    wire [1:0] quant_k_rd_token;
-    wire [2:0] quant_k_rd_feature;
-    wire [19:0] q_raw_data;
-    wire [19:0] k_raw_data;
-    wire [19:0] v_raw_data;
-    wire quant_busy;
-
-    attention_projection_result_buffer u_projection_result_buffer (
-        .clk_i(clk_i),
-        .rst_ni(rst_ni),
-        .start_i(projection_start),
-        .token_select_i(token_select),
-        .projection_select_i(projection_select),
-        .result_write_i(result_write && !qkt_mode),
-        .result_addr_i(result_addr),
-        .result_data_i(result_data),
-        .q_rd_token_i(quant_busy ? quant_q_rd_token : observe_token_i),
-        .q_rd_feature_i(quant_busy ? quant_q_rd_feature : observe_feature_i),
-        .k_rd_token_i(quant_busy ? quant_k_rd_token : observe_token_i),
-        .k_rd_feature_i(quant_busy ? quant_k_rd_feature : observe_feature_i),
-        .v_rd_token_i(observe_token_i),
-        .v_rd_feature_i(observe_feature_i),
-        .q_data_o(q_raw_data),
-        .k_data_o(k_raw_data),
-        .v_data_o(v_raw_data)
-    );
-
-    //===================== Q/K REQUANTIZATION ================================
-    wire [1:0] q8_rd_token;
-    wire [2:0] q8_rd_feature;
-    wire signed [7:0] q8_data;
-    wire [1:0] k8_rd_token;
-    wire [2:0] k8_rd_feature;
-    wire signed [7:0] k8_data;
-    wire [6:0] q_shift;
-    wire [6:0] k_shift;
-
     // Q8/K8 read ports are shared by the packers and the observation path.
     wire [1:0] packer_q8_rd_token;
     wire [2:0] packer_q8_rd_feature;
@@ -322,69 +401,158 @@ module attention_top #(
     assign k8_rd_token   = k8_packer_busy ? packer_k8_rd_token : observe_token_i;
     assign k8_rd_feature = k8_packer_busy ? packer_k8_rd_feature : observe_feature_i;
 
-    generate
-        if (INTEGRATION_STAGE >= 2) begin : GEN_QUANTIZATION
-            attention_qk_quantization_controller #(
-                .NUM_TOKENS(4),
-        .NUM_FEATURES(8),
-        .DATA_WIDTH(20),
-        .SHIFT_WIDTH(7),
-        .PSUM_SINGLE_PORT(1)
-    ) u_quantization (
-        .clk_i(clk_i),
-        .rst_ni(rst_ni),
-        .start_i(quant_start),
-        .busy_o(quant_busy),
-        .done_o(quant_done),
-        .q_raw_rd_token_o(quant_q_rd_token),
-        .q_raw_rd_feature_o(quant_q_rd_feature),
-        .q_raw_data_i(q_raw_data),
-        .k_raw_rd_token_o(quant_k_rd_token),
-        .k_raw_rd_feature_o(quant_k_rd_feature),
-        .k_raw_data_i(k_raw_data),
-        .psum_rd_req_o(psum_rd_req),
-        .psum_rd_page_o(psum_rd_page),
-        .psum_rd_feature_o(psum_rd_feature),
+//===================== RAW RESULT STORAGE =========================
 
-        .psum_rd_ready_i(psum_rd_ready),
-        .psum_rd_valid_i(psum_rd_valid),
-        .psum_rd_data_i(psum_rd_data),
-        .q8_rd_token_i(q8_rd_token),
-        .q8_rd_feature_i(q8_rd_feature),
-        .q8_data_o(q8_data),
-        .k8_rd_token_i(k8_rd_token),
-        .k8_rd_feature_i(k8_rd_feature),
-        .k8_data_o(k8_data),
-        .q_shift_o(q_shift),
-        .k_shift_o(k_shift)
-            );
-        end else begin : GEN_NO_QUANTIZATION
-            assign quant_busy = 1'b0;
-            assign quant_done = 1'b0;
-            assign quant_q_rd_token = 2'd0;
-            assign quant_q_rd_feature = 3'd0;
-            assign quant_k_rd_token = 2'd0;
-            assign quant_k_rd_feature = 3'd0;
-            assign q8_data = 8'sd0;
-            assign k8_data = 8'sd0;
-            assign q_shift = 7'd0;
-            assign k_shift = 7'd0;
-        end
-    endgenerate
+generate
+    if (PSUM_SINGLE_PORT == 0) begin : GEN_LEGACY_RESULT_BUFFER
 
-    // Intermediate-value observation keeps stage-specific buffers measurable.
-    always @(*) begin
-        case (observe_select_i)
-            3'd0: observe_data_o = q_raw_data;
-            3'd1: observe_data_o = k_raw_data;
-            3'd2: observe_data_o = v_raw_data;
-            3'd3: observe_data_o = {{12{q8_data[7]}}, q8_data};
-            3'd4: observe_data_o = {{12{k8_data[7]}}, k8_data};
-            3'd5: observe_data_o = {13'd0, q_shift};
-            3'd6: observe_data_o = {13'd0, k_shift};
-            default: observe_data_o = 20'd0;
-        endcase
+        attention_projection_result_buffer u_projection_result_buffer (
+            .clk_i(clk_i),
+            .rst_ni(rst_ni),
+
+            .start_i(projection_start),
+            .token_select_i(token_select),
+            .projection_select_i(projection_select),
+
+            .result_write_i(result_write && !qkt_mode),
+            .result_addr_i(result_addr),
+            .result_data_i(result_data),
+
+            .q_rd_token_i(
+                quant_busy ? quant_q_rd_token : observe_token_i
+            ),
+            .q_rd_feature_i(
+                quant_busy ? quant_q_rd_feature : observe_feature_i
+            ),
+
+            .k_rd_token_i(
+                quant_busy ? quant_k_rd_token : observe_token_i
+            ),
+            .k_rd_feature_i(
+                quant_busy ? quant_k_rd_feature : observe_feature_i
+            ),
+
+            .v_rd_token_i(observe_token_i),
+            .v_rd_feature_i(observe_feature_i),
+
+            .q_data_o(q_raw_data),
+            .k_data_o(k_raw_data),
+            .v_data_o(v_raw_data)
+        );
+
+    end else begin : GEN_INTERNAL_PSUM_ONLY
+
+        // No duplicated Q/K/V result buffer.
+        // Quantization uses the PSUM handshake interface.
+        assign q_raw_data = 20'd0;
+        assign k_raw_data = 20'd0;
+        assign v_raw_data = 20'd0;
+
     end
+endgenerate
+
+//===================== SHARED PSUM OBSERVATION =====================
+
+// Raw observation selectors:
+// 0 = Q, 1 = K, 2 = V
+wire observe_raw_select = (observe_select_i <= 3'd2);
+
+// Observation is allowed only when the attention operation
+// and the quantization controller are inactive.
+reg observe_pending;
+
+assign observe_ready_o =
+    !busy_o &&
+    !adapter_busy &&
+    ((INTEGRATION_STAGE < 2) || !quant_busy) &&
+    !observe_pending &&
+    (
+        ((PSUM_SINGLE_PORT != 0) && observe_raw_select)
+        ? (core_psum_rd_ready && !psum_rd_req)
+        : 1'b1
+    );
+
+wire observe_accept = observe_req_i && observe_ready_o;
+
+// Only raw observations need access to OpenEye PSUM RAM.
+// Q8/K8 and shifts are already stored in the quantization controller.
+wire observe_psum_req =
+    (PSUM_SINGLE_PORT != 0) &&
+    observe_raw_select &&
+    observe_accept;
+
+// Multiplex the single physical PSUM read interface.
+// Quantization has priority.
+assign core_psum_rd_req =
+    psum_rd_req || observe_psum_req;
+
+assign core_psum_rd_page =
+    psum_rd_req
+        ? psum_rd_page
+        : {observe_select_i[1:0], observe_token_i};
+
+assign core_psum_rd_feature =
+    psum_rd_req
+        ? psum_rd_feature
+        : observe_feature_i;
+
+// Observation response FSM
+always @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+        observe_pending <= 1'b0;
+        observe_valid_o <= 1'b0;
+        observe_data_o <= 20'd0;
+    end else begin
+        observe_valid_o <= 1'b0;
+
+        if (observe_pending) begin
+
+            // Wait for the synchronous OpenEye PSUM read response.
+            if (core_psum_rd_valid) begin
+                observe_data_o <= core_psum_rd_data;
+                observe_valid_o <= 1'b1;
+                observe_pending <= 1'b0;
+            end
+
+        end else if (observe_accept) begin
+
+            if ((PSUM_SINGLE_PORT != 0) && observe_raw_select) begin
+
+                // Read request is accepted by OpenEye.
+                // Response arrives a few clocks later.
+                observe_pending <= 1'b1;
+
+            end else begin
+
+                // Legacy raw buffer or quantized observation.
+                // Capture the available data on this clock edge.
+                case (observe_select_i)
+
+                    3'd0: observe_data_o <= q_raw_data;
+                    3'd1: observe_data_o <= k_raw_data;
+                    3'd2: observe_data_o <= v_raw_data;
+
+                    3'd3: observe_data_o <=
+                        {{12{q8_data[7]}}, q8_data};
+
+                    3'd4: observe_data_o <=
+                        {{12{k8_data[7]}}, k8_data};
+
+                    3'd5: observe_data_o <=
+                        {13'd0, q_shift};
+
+                    3'd6: observe_data_o <=
+                        {13'd0, k_shift};
+
+                    default: observe_data_o <= 20'd0;
+
+                endcase
+
+                observe_valid_o <= 1'b1;
+            end
+        end
+    end
+end
 
     // Shared Score Buffer read interface across all configurations.
     assign selected_score_rd_token =
@@ -492,9 +660,6 @@ module attention_top #(
         .complete_o(scores_complete_o)
     );
         end else begin : GEN_NO_QKT
-            assign psum_rd_req = 1'b0;
-            assign psum_rd_page = 4'd0;
-            assign psum_rd_feature = 3'd0;
             assign packer_q8_rd_token = 2'd0;
             assign packer_q8_rd_feature = 3'd0;
             assign packer_k8_rd_token = 2'd0;

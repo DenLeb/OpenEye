@@ -128,6 +128,50 @@ def test_attention_top_e2e(stage, test_case):
         },
     )
 
+async def read_observe(dut, select, token, feature):
+    dut.observe_req_i.value = 0
+
+    # Set the requested address and selector
+    dut.observe_select_i.value = select
+    dut.observe_token_i.value = token
+    dut.observe_feature_i.value = feature
+
+    # Wait for the interface to become ready
+    for _ in range(100):
+        await FallingEdge(dut.clk_i)
+        await Timer(1, unit="ns")
+
+        if int(dut.observe_ready_o.value):
+            break
+    else:
+        raise AssertionError("Observation interface not ready")
+
+    # Submit one read request
+    dut.observe_req_i.value = 1
+
+    await RisingEdge(dut.clk_i)
+    await Timer(1, unit="ns")
+
+    immediate = int(dut.observe_valid_o.value)
+    data = int(dut.observe_data_o.value) if immediate else None
+
+    await FallingEdge(dut.clk_i)
+    dut.observe_req_i.value = 0
+
+    if immediate:
+        return data
+
+    # Wait for multi-cycle PSUM response
+    await with_timeout(
+        RisingEdge(dut.observe_valid_o),
+        2000,
+        "ns"
+    )
+
+    await Timer(1, unit="ns")
+
+    return int(dut.observe_data_o.value)
+
 
 @cocotb.test()
 async def check_stage1_projection(dut):
@@ -169,6 +213,7 @@ async def check_stage1_projection(dut):
     dut.observe_select_i.value = 0
     dut.observe_token_i.value = 0
     dut.observe_feature_i.value = 0
+    dut.observe_req_i.value = 0
 
     dut.score_rd_token_i.value = 0
     dut.score_rd_index_i.value = 0
@@ -188,6 +233,11 @@ async def check_stage1_projection(dut):
     for _ in range(20):
         await FallingEdge(dut.clk_i)
 
+    ready = str(dut.observe_ready_o.value)
+
+    assert ready in ("0", "1"), (
+        f"Observation ready is unresolved before execution: {ready}"
+    )
     # Monitor actual DMA results
     projection_beats = 0
     seen_projections = set()
@@ -271,6 +321,18 @@ async def check_stage1_projection(dut):
     assert int(dut.softmax_complete_o.value) == 0
     assert int(dut.prob_rd_valid_o.value) == 0
 
+    dut._log.info(
+        "PSUM DEBUG: busy=%s adapter_busy=%s "
+        "observe_ready=%s pending=%s core_ready=%s "
+        "attention_active=%s",
+        dut.busy_o.value,
+        dut.adapter_busy.value,
+        dut.observe_ready_o.value,
+        dut.observe_pending.value,
+        dut.core_psum_rd_ready.value,
+        dut.u_openeye.psum_attention_active.value,
+    )
+
     # Read and compare all 96 Q/K/V values
     def signed20(raw):
         raw = int(raw)
@@ -288,11 +350,14 @@ async def check_stage1_projection(dut):
                 dut.observe_token_i.value = token
                 dut.observe_feature_i.value = feature
 
-                await Timer(1, unit="ns")
-
-                actual[token, feature] = signed20(
-                    dut.observe_data_o.value
+                raw = await read_observe(
+                    dut,
+                    select,
+                    token,
+                    feature
                 )
+
+                actual[token, feature] = signed20(raw)
 
         dut._log.info(
             "%s expected:\n%s",
@@ -366,6 +431,7 @@ async def check_complete_attention_dataflow(dut):
     dut.observe_select_i.value = 0
     dut.observe_token_i.value = 0
     dut.observe_feature_i.value = 0
+    dut.observe_req_i.value = 0
 
     cocotb.start_soon(Clock(dut.clk_i, 20, unit="ns").start())
     for _ in range(12):
@@ -417,7 +483,32 @@ async def check_complete_attention_dataflow(dut):
     await FallingEdge(dut.clk_i)
     finished = True
     monitor_task.cancel()
+    # Debug Q8/K8 after the complete attention operation
+    for name, select, expected in [
+        ("Q8", 3, q8),
+        ("K8", 4, k8),
+    ]:
+        actual = np.zeros((4, 8), dtype=np.int64)
 
+        for token in range(4):
+            for feature in range(8):
+                raw = await read_observe(
+                    dut, select, token, feature
+                )
+
+                value = raw & 0xFF
+                actual[token, feature] = (
+                    value - 256 if value & 0x80 else value
+                )
+
+        dut._log.info(
+            "%s DEBUG:\nExpected:\n%s\nActual:\n%s",
+            name, expected, actual
+        )
+
+    for name, select in [("Q shift", 5), ("K shift", 6)]:
+        shift = await read_observe(dut, select, 0, 0)
+        dut._log.info("%s DEBUG: %d", name, shift)
     assert int(dut.scores_complete_o.value) == 1, (
         "Global DONE but QKT score buffer is incomplete"
     )
