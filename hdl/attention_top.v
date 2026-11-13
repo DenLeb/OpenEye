@@ -336,7 +336,8 @@ generate
 endgenerate
     //===================== ONE SHARED OPENEYE ================================
     OpenEye_FPGA #(
-    .ATTENTION_PSUM_ENABLE(1)
+        .ATTENTION_PSUM_ENABLE(1),
+        .ATTENTION_SOFTMAX_ENABLE(INTEGRATION_STAGE == 4)
     ) u_openeye (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
@@ -351,6 +352,22 @@ endgenerate
         .psum_result_rd_ready_o(core_psum_rd_ready),
         .psum_result_rd_valid_o(core_psum_rd_valid),
         .psum_result_rd_data_o(core_psum_rd_data),
+
+        // Softmax FSM and probability storage are now inside OpenEye_FPGA.
+        .softmax_start_i(softmax_start),
+        .softmax_q_shift_i(q_shift),
+        .softmax_k_shift_i(k_shift),
+        .softmax_score_rd_token_o(softmax_score_rd_token),
+        .softmax_score_rd_index_o(softmax_score_rd_index),
+        .softmax_score_rd_data_i(score_buffer_rd_data),
+        .softmax_score_rd_valid_i(score_buffer_rd_valid),
+        .softmax_prob_rd_token_i(prob_rd_token_i),
+        .softmax_prob_rd_index_i(prob_rd_index_i),
+        .softmax_prob_rd_data_o(prob_rd_data_o),
+        .softmax_prob_rd_valid_o(prob_rd_valid_o),
+        .softmax_busy_o(softmax_busy),
+        .softmax_done_o(softmax_done),
+        .softmax_complete_o(softmax_complete_o),
 
         // DMA input
         .data_dma_i(dma_input_data),
@@ -674,46 +691,8 @@ end
         end
     endgenerate
 
-    //===================== ATTENTION SOFTMAX ===============================
-
-    generate
-        if (INTEGRATION_STAGE == 4) begin : GEN_SOFTMAX
-    attention_softmax u_softmax (
-        .clk_i(clk_i),
-        .rst_ni(rst_ni),
-        .start_i(softmax_start),
-
-        // Quantization shifts
-        .q_shift_i(q_shift),
-        .k_shift_i(k_shift),
-
-        // QKT Score Buffer read interface
-        .score_rd_token_o(softmax_score_rd_token),
-        .score_rd_index_o(softmax_score_rd_index),
-        .score_rd_data_i(score_buffer_rd_data),
-        .score_rd_valid_i(score_buffer_rd_valid),
-
-        // Probability read interface
-        .prob_rd_token_i(prob_rd_token_i),
-        .prob_rd_index_i(prob_rd_index_i),
-        .prob_rd_data_o(prob_rd_data_o),
-        .prob_rd_valid_o(prob_rd_valid_o),
-
-        // Control
-        .busy_o(softmax_busy),
-        .done_o(softmax_done),
-        .complete_o(softmax_complete_o)
-    );
-        end else begin : GEN_NO_SOFTMAX
-            assign softmax_score_rd_token = 2'd0;
-            assign softmax_score_rd_index = 2'd0;
-            assign softmax_busy = 1'b0;
-            assign softmax_done = 1'b0;
-            assign softmax_complete_o = 1'b0;
-            assign prob_rd_data_o = 16'd0;
-            assign prob_rd_valid_o = 1'b0;
-        end
-    endgenerate
+    // Stage-4 Softmax FSM lives in OpenEye_FPGA. The QKT Score Buffer
+    // and its original combinational read interface remain unchanged.
 
 `ifndef SYNTHESIS
     initial begin

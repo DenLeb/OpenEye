@@ -135,6 +135,7 @@ module OpenEye_FPGA #(
     parameter SERIAL        = 1,
 
     parameter ATTENTION_PSUM_ENABLE = 0,
+    parameter ATTENTION_SOFTMAX_ENABLE = 0,
 
     parameter ADDR_IACT_BITWIDTH = 4,
     parameter ADDR_WGHT_BITWIDTH = 8,
@@ -290,7 +291,24 @@ module OpenEye_FPGA #(
 
     output wire psum_result_rd_ready_o,
     output reg psum_result_rd_valid_o,
-    output reg [DATA_PSUM_BITWIDTH-1:0] psum_result_rd_data_o 
+    output reg [DATA_PSUM_BITWIDTH-1:0] psum_result_rd_data_o,
+
+    // Optional integrated 4x4 attention Softmax FSM (disabled by default).
+    // QKT score storage remains outside OpenEye_FPGA.
+    input wire softmax_start_i,
+    input wire [6:0] softmax_q_shift_i,
+    input wire [6:0] softmax_k_shift_i,
+    output wire [1:0] softmax_score_rd_token_o,
+    output wire [1:0] softmax_score_rd_index_o,
+    input wire signed [19:0] softmax_score_rd_data_i,
+    input wire softmax_score_rd_valid_i,
+    input wire [1:0] softmax_prob_rd_token_i,
+    input wire [1:0] softmax_prob_rd_index_i,
+    output wire [15:0] softmax_prob_rd_data_o,
+    output wire softmax_prob_rd_valid_o,
+    output wire softmax_busy_o,
+    output wire softmax_done_o,
+    output wire softmax_complete_o
 );
 
   //#######################
@@ -369,6 +387,184 @@ module OpenEye_FPGA #(
           endcase
       end
   end
+
+  //==========================================================================
+  // Integrated Attention Softmax FSM
+  // The FSM, row score register, and probability storage are native to this
+  // module. Only the existing attention_softmax_row arithmetic hierarchy is
+  // instantiated. QKT scores remain in attention_qkt_score_buffer at top level.
+  //==========================================================================
+  generate
+    if (ATTENTION_SOFTMAX_ENABLE != 0) begin : GEN_ATTENTION_SOFTMAX
+    localparam [2:0]
+        SM_IDLE      = 3'd0,
+        SM_LOAD_ROW  = 3'd1,
+        SM_ROW_START = 3'd2,
+        SM_ROW_WAIT  = 3'd3,
+        SM_STORE_ROW = 3'd4,
+        SM_FINISH    = 3'd5;
+
+    reg [2:0] sm_state;
+
+    // Current position in the 4x4 matrix
+    reg [1:0] sm_row_index;
+    reg [1:0] sm_col_index;
+
+    // Four 20-bit scores for the current row
+    reg [79:0] sm_row_scores_reg;
+
+    // Capture quantization shifts at start
+    reg [6:0] sm_q_shift_reg;
+    reg [6:0] sm_k_shift_reg;
+
+    // Result storage: 16 probabilities
+    reg [15:0] sm_probability_mem [0:15];
+    reg [15:0] sm_probability_valid;
+
+    // Row processor interface
+    wire [63:0] sm_row_probabilities;
+    wire        sm_row_start;
+    wire        sm_row_busy;
+    wire        sm_row_done;
+
+    // Score Buffer read address
+    assign softmax_score_rd_token_o = sm_row_index;
+    assign softmax_score_rd_index_o = sm_col_index;
+
+    // Row processor control
+    assign sm_row_start = (sm_state == SM_ROW_START);
+
+    assign softmax_busy_o = (sm_state != SM_IDLE) && (sm_state != SM_FINISH);
+    assign softmax_done_o = (sm_state == SM_FINISH);
+
+    // All 16 probabilities are available
+    assign softmax_complete_o = &sm_probability_valid;
+
+
+    // Row-Parallel Softmax processor
+    attention_softmax_row u_attention_softmax_row (
+        .clk_i           (clk_i),
+        .rst_ni          (rst_n),
+        .start_i         (sm_row_start),
+
+        .scores_i        (sm_row_scores_reg),
+        .q_shift_i       (sm_q_shift_reg),
+        .k_shift_i       (sm_k_shift_reg),
+
+        .probabilities_o (sm_row_probabilities),
+        .busy_o          (sm_row_busy),
+        .done_o          (sm_row_done)
+    );
+
+    wire [3:0] sm_prob_read_addr;
+
+    assign sm_prob_read_addr = {
+        softmax_prob_rd_token_i,
+        softmax_prob_rd_index_i
+    };
+
+    assign softmax_prob_rd_valid_o = sm_probability_valid[sm_prob_read_addr];
+
+    assign softmax_prob_rd_data_o = softmax_prob_rd_valid_o
+                        ? sm_probability_mem[sm_prob_read_addr]
+                        : 16'd0;
+
+                        
+    always @(posedge clk_i or negedge rst_n) begin
+        if (!rst_n) begin
+            sm_state             <= SM_IDLE;
+            sm_row_index         <= 2'd0;
+            sm_col_index         <= 2'd0;
+            sm_row_scores_reg    <= 80'd0;
+            sm_q_shift_reg       <= 7'd0;
+            sm_k_shift_reg       <= 7'd0;
+            sm_probability_valid <= 16'd0;
+        end else begin
+            case (sm_state)
+
+                SM_IDLE: begin
+                    if (softmax_start_i) begin
+                        sm_row_index         <= 2'd0;
+                        sm_col_index         <= 2'd0;
+                        sm_row_scores_reg    <= 80'd0;
+                        sm_q_shift_reg       <= softmax_q_shift_i;
+                        sm_k_shift_reg       <= softmax_k_shift_i;
+                        sm_probability_valid <= 16'd0;
+                        sm_state             <= SM_LOAD_ROW;
+                    end
+                end
+
+                SM_LOAD_ROW: begin
+                    if (softmax_score_rd_valid_i) begin
+                        sm_row_scores_reg[sm_col_index*20 +: 20]
+                            <= softmax_score_rd_data_i;
+
+                        if (sm_col_index == 2'd3) begin
+                            sm_col_index <= 2'd0;
+                            sm_state     <= SM_ROW_START;
+                        end else begin
+                            sm_col_index <= sm_col_index + 1'b1;
+                        end
+                    end
+                end
+
+                SM_ROW_START: begin
+                    sm_state <= SM_ROW_WAIT;
+                end
+
+                SM_ROW_WAIT: begin
+                    if (sm_row_done) begin
+                        sm_state <= SM_STORE_ROW;
+                    end
+                end
+
+                SM_STORE_ROW: begin
+                    sm_probability_mem[{sm_row_index, 2'b00}]
+                        <= sm_row_probabilities[15:0];
+
+                    sm_probability_mem[{sm_row_index, 2'b01}]
+                        <= sm_row_probabilities[31:16];
+
+                    sm_probability_mem[{sm_row_index, 2'b10}]
+                        <= sm_row_probabilities[47:32];
+
+                    sm_probability_mem[{sm_row_index, 2'b11}]
+                        <= sm_row_probabilities[63:48];
+
+                    sm_probability_valid[{sm_row_index, 2'b00} +: 4]
+                        <= 4'b1111;
+
+                    if (sm_row_index == 2'd3) begin
+                        sm_state <= SM_FINISH;
+                    end else begin
+                        sm_row_index      <= sm_row_index + 1'b1;
+                        sm_col_index      <= 2'd0;
+                        sm_row_scores_reg <= 80'd0;
+                        sm_state          <= SM_LOAD_ROW;
+                    end
+                end
+
+                SM_FINISH: begin
+                    sm_state <= SM_IDLE;
+                end
+
+                default: begin
+                    sm_state <= SM_IDLE;
+                end
+
+            endcase
+        end
+    end
+    end else begin : GEN_NO_ATTENTION_SOFTMAX
+      assign softmax_score_rd_token_o = 2'd0;
+      assign softmax_score_rd_index_o = 2'd0;
+      assign softmax_prob_rd_data_o = 16'd0;
+      assign softmax_prob_rd_valid_o = 1'b0;
+      assign softmax_busy_o = 1'b0;
+      assign softmax_done_o = 1'b0;
+      assign softmax_complete_o = 1'b0;
+    end
+  endgenerate
 
   RST_SYNC rst_sync_wrapper (
       .clk_i (clk_i),
