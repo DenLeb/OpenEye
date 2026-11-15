@@ -505,10 +505,21 @@ async def check_complete_attention_dataflow(dut):
             "%s DEBUG:\nExpected:\n%s\nActual:\n%s",
             name, expected, actual
         )
-
-    for name, select in [("Q shift", 5), ("K shift", 6)]:
+        assert np.array_equal(actual, expected), (
+            f"{name} quantization mismatch\n"
+            f"Expected:\n{expected}\n"
+            f"Actual:\n{actual}"
+        )
+    for name, select, expected_shift in [
+        ("Q shift", 5, q_shift),
+        ("K shift", 6, k_shift),
+    ]:
         shift = await read_observe(dut, select, 0, 0)
         dut._log.info("%s DEBUG: %d", name, shift)
+
+        assert shift == expected_shift, (
+            f"{name}: expected {expected_shift}, got {shift}"
+        )
     assert int(dut.scores_complete_o.value) == 1, (
         "Global DONE but QKT score buffer is incomplete"
     )

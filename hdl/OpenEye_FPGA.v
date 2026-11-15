@@ -135,6 +135,7 @@ module OpenEye_FPGA #(
     parameter SERIAL        = 1,
 
     parameter ATTENTION_PSUM_ENABLE = 0,
+    parameter ATTENTION_QUANT_ENABLE = 0,
     parameter ATTENTION_SOFTMAX_ENABLE = 0,
 
     parameter ADDR_IACT_BITWIDTH = 4,
@@ -293,6 +294,29 @@ module OpenEye_FPGA #(
     output reg psum_result_rd_valid_o,
     output reg [DATA_PSUM_BITWIDTH-1:0] psum_result_rd_data_o,
 
+    // ============================================================
+    // Integrated Q/K Quantization Controller
+    // Enabled through ATTENTION_QUANT_ENABLE.
+    // ============================================================
+
+    input wire quant_start_i,
+    output wire quant_busy_o,
+    output wire quant_done_o,
+
+    // Independent combinational Q8 read interface
+    input wire [1:0] q8_rd_token_i,
+    input wire [2:0] q8_rd_feature_i,
+    output wire signed [7:0] q8_data_o,
+
+    // Independent combinational K8 read interface
+    input wire [1:0] k8_rd_token_i,
+    input wire [2:0] k8_rd_feature_i,
+    output wire signed [7:0] k8_data_o,
+
+    // Independent quantization shifts
+    output wire [6:0] quant_q_shift_o,
+    output wire [6:0] quant_k_shift_o,
+
     // Optional integrated 4x4 attention Softmax FSM (disabled by default).
     // QKT score storage remains outside OpenEye_FPGA.
     input wire softmax_start_i,
@@ -327,6 +351,11 @@ module OpenEye_FPGA #(
       ? ({{(BUFFER_WIDTH_PSUM-4){1'b0}}, psum_page_i} << 5)
       : {BUFFER_WIDTH_PSUM{1'b0}};
 
+
+  // ============================================================
+  // Shared PSUM reader: integrated quantization and observation
+  // ============================================================
+
   localparam [1:0]
       EXT_IDLE      = 2'd0,
       EXT_RAM_READ  = 2'd1,
@@ -336,57 +365,543 @@ module OpenEye_FPGA #(
   reg [1:0] ext_rd_state;
   reg [BUFFER_WIDTH_PSUM-1:0] ext_rd_addr;
 
-  wire ext_rd_active = (ext_rd_state == EXT_RAM_READ);
+  // Identifies the owner of the outstanding read transaction.
+  // 1 = integrated quantization
+  // 0 = external observation
+  reg ext_rd_owner_quant;
 
-  assign psum_result_rd_ready_o =
+  // Internal quantization PSUM interface
+  wire quant_psum_req;
+  wire [3:0] quant_psum_page;
+  wire [2:0] quant_psum_feature;
+  wire quant_psum_ready;
+
+  reg quant_psum_valid;
+
+  // Both requesters use the same registered read-data register.
+  wire signed [19:0] quant_psum_data =
+      psum_result_rd_data_o;
+
+  wire ext_rd_active =
+      (ext_rd_state == EXT_RAM_READ);
+
+  // Existing PSUM access restrictions are preserved.
+  wire ext_rd_available =
       psum_attention_active &&
       (ext_rd_state == EXT_IDLE) &&
       (fsm_psum_current_state == 0) &&
       !(|psum_buffer_en_w) &&
       !(|psum_buffer_en_r);
 
+  // Quantization always receives priority.
+  assign quant_psum_ready = ext_rd_available;
+
+  // External observations are blocked during quantization.
+  // With ATTENTION_QUANT_ENABLE=0 this is the legacy interface.
+  assign psum_result_rd_ready_o =
+      ext_rd_available &&
+      !(
+          (ATTENTION_QUANT_ENABLE != 0) &&
+          (quant_busy_o || quant_start_i || quant_psum_req)
+      );
+
+  wire ext_rd_accept_quant =
+      quant_psum_req && quant_psum_ready;
+
+  wire ext_rd_accept_observe =
+      psum_result_rd_req_i && psum_result_rd_ready_o;
+
   always @(posedge clk_i or negedge rst_n) begin
       if (!rst_n) begin
           ext_rd_state <= EXT_IDLE;
           ext_rd_addr <= {BUFFER_WIDTH_PSUM{1'b0}};
+          ext_rd_owner_quant <= 1'b0;
+
           psum_result_rd_valid_o <= 1'b0;
-          psum_result_rd_data_o <= {DATA_PSUM_BITWIDTH{1'b0}};
+          psum_result_rd_data_o <=
+              {DATA_PSUM_BITWIDTH{1'b0}};
+
+          quant_psum_valid <= 1'b0;
+
       end else begin
           psum_result_rd_valid_o <= 1'b0;
+          quant_psum_valid <= 1'b0;
 
           case (ext_rd_state)
-              EXT_IDLE: begin
-                  if (psum_result_rd_req_i &&
-                      psum_result_rd_ready_o) begin
 
+              EXT_IDLE: begin
+
+                  // Priority 1: internal quantization
+                  if (ext_rd_accept_quant) begin
+                      ext_rd_addr <=
+                          ({{(BUFFER_WIDTH_PSUM-4){1'b0}},
+                            quant_psum_page} << 5)
+                          + quant_psum_feature;
+
+                      ext_rd_owner_quant <= 1'b1;
+                      ext_rd_state <= EXT_RAM_READ;
+
+                  // Priority 2: external observation
+                  end else if (ext_rd_accept_observe) begin
                       ext_rd_addr <=
                           ({{(BUFFER_WIDTH_PSUM-4){1'b0}},
                             psum_result_rd_page_i} << 5)
                           + psum_result_rd_feature_i;
 
+                      ext_rd_owner_quant <= 1'b0;
                       ext_rd_state <= EXT_RAM_READ;
                   end
               end
 
-              EXT_RAM_READ:
+              EXT_RAM_READ: begin
                   ext_rd_state <= EXT_PIPE_WAIT;
+              end
 
-              EXT_PIPE_WAIT:
+              EXT_PIPE_WAIT: begin
                   ext_rd_state <= EXT_CAPTURE;
+              end
 
               EXT_CAPTURE: begin
-                  psum_result_rd_data_o <=
-                      psum_buffer_data_r[0+:DATA_PSUM_BITWIDTH];
 
-                  psum_result_rd_valid_o <= 1'b1;
+                  // One common registered PSUM data output.
+                  psum_result_rd_data_o <=
+                      psum_buffer_data_r[
+                          0 +: DATA_PSUM_BITWIDTH
+                      ];
+
+                  // Only the requesting owner receives valid.
+                  if (ext_rd_owner_quant) begin
+                      quant_psum_valid <= 1'b1;
+                  end else begin
+                      psum_result_rd_valid_o <= 1'b1;
+                  end
+
                   ext_rd_state <= EXT_IDLE;
               end
 
-              default:
+              default: begin
                   ext_rd_state <= EXT_IDLE;
+              end
+
           endcase
       end
   end
+
+
+  // ============================================================
+  // Integrated Q/K Quantization Controller
+  // Geometry: 4 tokens x 8 features, signed 20-bit input.
+  // Two independent INT8 quantization units.
+  // The external legacy controller is not instantiated here.
+  // ============================================================
+
+  generate
+    if (ATTENTION_QUANT_ENABLE != 0) begin : GEN_ATTENTION_QUANT
+
+      localparam integer QK_DATA_WIDTH  = 20;
+      localparam integer QK_SHIFT_WIDTH = 7;
+      localparam integer QK_TOTAL       = 32;
+      localparam integer QK_INDEX_BITS  = 5;
+
+      // Preserve the original single-port FSM state encoding.
+      localparam [3:0]
+          QK_IDLE          = 4'd0,
+          QK_PICK_SHIFT    = 4'd2,
+          QK_DRAIN         = 4'd4,
+          QK_PSUM_REQ_Q    = 4'd5,
+          QK_PSUM_WAIT_Q   = 4'd6,
+          QK_PSUM_REQ_K    = 4'd7,
+          QK_PSUM_WAIT_K   = 4'd8,
+          QK_PSUM_USE_PAIR = 4'd9;
+
+      reg [3:0] qk_state;
+
+      reg psum_feed_phase;
+
+      reg signed [QK_DATA_WIDTH-1:0] psum_q_reg;
+      reg signed [QK_DATA_WIDTH-1:0] psum_k_reg;
+
+      reg [QK_INDEX_BITS-1:0] scan_index;
+      reg [QK_INDEX_BITS-1:0] feed_index;
+
+      reg [QK_DATA_WIDTH:0] q_max_abs;
+      reg [QK_DATA_WIDTH:0] k_max_abs;
+
+      reg [QK_SHIFT_WIDTH-1:0] q_shift_reg;
+      reg [QK_SHIFT_WIDTH-1:0] k_shift_reg;
+
+      reg qk_busy;
+      reg qk_done;
+
+      assign quant_busy_o = qk_busy;
+      assign quant_done_o = qk_done;
+
+      assign quant_q_shift_o = q_shift_reg;
+      assign quant_k_shift_o = k_shift_reg;
+
+      // ========================================================
+      // PSUM addressing
+      // Q pages: 0..3
+      // K pages: 4..7
+      // ========================================================
+
+      wire [QK_INDEX_BITS-1:0] raw_read_index =
+          psum_feed_phase ? feed_index : scan_index;
+
+      wire [1:0] psum_token = raw_read_index[4:3];
+      wire [2:0] psum_feature = raw_read_index[2:0];
+
+      assign quant_psum_req =
+          (qk_state == QK_PSUM_REQ_Q) ||
+          (qk_state == QK_PSUM_REQ_K);
+
+      assign quant_psum_page = {
+          (qk_state == QK_PSUM_REQ_K ? 2'd1 : 2'd0),
+          psum_token
+      };
+
+      assign quant_psum_feature = psum_feature;
+
+      // Both raw samples are held until a complete pair
+      // has been read from the internal PSUM RAM.
+      wire signed [QK_DATA_WIDTH-1:0] q_raw_sample =
+          psum_q_reg;
+
+      wire signed [QK_DATA_WIDTH-1:0] k_raw_sample =
+          psum_k_reg;
+
+      // ========================================================
+      // Q8 and K8 register memories
+      // Independent combinational read ports.
+      // ========================================================
+
+      reg signed [7:0] q8_mem [0:QK_TOTAL-1];
+      reg signed [7:0] k8_mem [0:QK_TOTAL-1];
+
+      wire [QK_INDEX_BITS-1:0] q8_read_index = {
+          q8_rd_token_i,
+          q8_rd_feature_i
+      };
+
+      wire [QK_INDEX_BITS-1:0] k8_read_index = {
+          k8_rd_token_i,
+          k8_rd_feature_i
+      };
+
+      assign q8_data_o = q8_mem[q8_read_index];
+      assign k8_data_o = k8_mem[k8_read_index];
+
+      // ========================================================
+      // Maximum absolute value calculation
+      // Widen before negation to support -524288.
+      // ========================================================
+
+      function [QK_DATA_WIDTH:0] magnitude;
+          input signed [QK_DATA_WIDTH-1:0] value;
+          reg signed [QK_DATA_WIDTH:0] extended;
+          begin
+              extended = {value[QK_DATA_WIDTH-1], value};
+              magnitude =
+                  (extended < 0) ? -extended : extended;
+          end
+      endfunction
+
+      // Smallest shift satisfying:
+      // max(abs(raw)) <= 127 * (2 ** shift)
+      function [QK_SHIFT_WIDTH-1:0] choose_shift;
+          input [QK_DATA_WIDTH:0] maximum;
+          integer s;
+          reg [QK_DATA_WIDTH:0] threshold;
+          begin
+              choose_shift = 0;
+
+              for (s = 0; s <= QK_DATA_WIDTH-7; s = s+1) begin
+                  threshold =
+                      {{(QK_DATA_WIDTH-6){1'b0}},7'd127} << s;
+
+                  if (maximum > threshold)
+                      choose_shift = s + 1;
+              end
+          end
+      endfunction
+
+      wire [QK_DATA_WIDTH:0] q_abs_now =
+          magnitude(q_raw_sample);
+
+      wire [QK_DATA_WIDTH:0] k_abs_now =
+          magnitude(k_raw_sample);
+
+      // ========================================================
+      // Rounding offset
+      // Preserve round-half-away-from-zero semantics.
+      // ========================================================
+
+      wire signed [QK_DATA_WIDTH-1:0] q_offset =
+          (q_shift_reg == 0)
+              ? {QK_DATA_WIDTH{1'b0}}
+              : (
+                  (
+                      $signed({
+                          {(QK_DATA_WIDTH-1){1'b0}}, 1'b1
+                      }) <<< (q_shift_reg - 1'b1)
+                  )
+                  - (q_raw_sample < 0 ? 1'b1 : 1'b0)
+                );
+
+      wire signed [QK_DATA_WIDTH-1:0] k_offset =
+          (k_shift_reg == 0)
+              ? {QK_DATA_WIDTH{1'b0}}
+              : (
+                  (
+                      $signed({
+                          {(QK_DATA_WIDTH-1){1'b0}}, 1'b1
+                      }) <<< (k_shift_reg - 1'b1)
+                  )
+                  - (k_raw_sample < 0 ? 1'b1 : 1'b0)
+                );
+
+      // ========================================================
+      // Existing quantization arithmetic units
+      // Arithmetic and three-edge pipeline are unchanged.
+      // ========================================================
+
+      wire signed [7:0] quantized_q;
+      wire signed [7:0] quantized_k;
+
+      quantization_unit #(
+          .PSUM_WIDTH(QK_DATA_WIDTH),
+          .MANT_WIDTH(25),
+          .OFFSET_WIDTH(QK_DATA_WIDTH),
+          .SHIFT_WIDTH(QK_SHIFT_WIDTH),
+          .OUT_WIDTH(8)
+      ) u_quant_q (
+          .clk_i(clk_i),
+          .rst_n(rst_n),
+          .quant_mant(25'sd1),
+          .psum_data(q_raw_sample),
+          .quant_offset(q_offset),
+          .current_shift(q_shift_reg),
+          .quantized_value(quantized_q)
+      );
+
+      quantization_unit #(
+          .PSUM_WIDTH(QK_DATA_WIDTH),
+          .MANT_WIDTH(25),
+          .OFFSET_WIDTH(QK_DATA_WIDTH),
+          .SHIFT_WIDTH(QK_SHIFT_WIDTH),
+          .OUT_WIDTH(8)
+      ) u_quant_k (
+          .clk_i(clk_i),
+          .rst_n(rst_n),
+          .quant_mant(25'sd1),
+          .psum_data(k_raw_sample),
+          .quant_offset(k_offset),
+          .current_shift(k_shift_reg),
+          .quantized_value(quantized_k)
+      );
+
+      // ========================================================
+      // Pipeline-valid and write-address alignment
+      // ========================================================
+
+      reg [2:0] valid_pipe;
+
+      reg [QK_INDEX_BITS-1:0] addr_pipe0;
+      reg [QK_INDEX_BITS-1:0] addr_pipe1;
+      reg [QK_INDEX_BITS-1:0] addr_pipe2;
+
+      integer qk_i;
+
+      always @(posedge clk_i or negedge rst_n) begin
+
+          if (!rst_n) begin
+
+              qk_state <= QK_IDLE;
+
+              scan_index <= 0;
+              feed_index <= 0;
+              psum_feed_phase <= 1'b0;
+
+              psum_q_reg <= 0;
+              psum_k_reg <= 0;
+
+              q_max_abs <= 0;
+              k_max_abs <= 0;
+
+              q_shift_reg <= 0;
+              k_shift_reg <= 0;
+
+              valid_pipe <= 0;
+              addr_pipe0 <= 0;
+              addr_pipe1 <= 0;
+              addr_pipe2 <= 0;
+
+              qk_busy <= 1'b0;
+              qk_done <= 1'b0;
+
+              for (qk_i = 0; qk_i < QK_TOTAL; qk_i = qk_i+1) begin
+                  q8_mem[qk_i] <= 8'sd0;
+                  k8_mem[qk_i] <= 8'sd0;
+              end
+
+          end else begin
+
+              qk_done <= 1'b0;
+
+              // Valid is asserted when one complete Q/K pair
+              // is presented to both arithmetic units.
+              valid_pipe <= {
+                  valid_pipe[1:0],
+                  (
+                      (qk_state == QK_PSUM_USE_PAIR) &&
+                      psum_feed_phase
+                  )
+              };
+
+              addr_pipe2 <= addr_pipe1;
+              addr_pipe1 <= addr_pipe0;
+              addr_pipe0 <= feed_index;
+
+              // Delayed write after the arithmetic pipeline.
+              if (valid_pipe[2]) begin
+                  q8_mem[addr_pipe2] <= quantized_q;
+                  k8_mem[addr_pipe2] <= quantized_k;
+              end
+
+              case (qk_state)
+
+                  QK_IDLE: begin
+                      if (quant_start_i) begin
+                          qk_state <= QK_PSUM_REQ_Q;
+
+                          qk_busy <= 1'b1;
+                          psum_feed_phase <= 1'b0;
+
+                          scan_index <= 0;
+                          feed_index <= 0;
+
+                          q_max_abs <= 0;
+                          k_max_abs <= 0;
+
+                          valid_pipe <= 0;
+                      end
+                  end
+
+                  QK_PSUM_REQ_Q: begin
+                      if (quant_psum_ready)
+                          qk_state <= QK_PSUM_WAIT_Q;
+                  end
+
+                  QK_PSUM_WAIT_Q: begin
+                      if (quant_psum_valid) begin
+                          psum_q_reg <= quant_psum_data;
+                          qk_state <= QK_PSUM_REQ_K;
+                      end
+                  end
+
+                  QK_PSUM_REQ_K: begin
+                      if (quant_psum_ready)
+                          qk_state <= QK_PSUM_WAIT_K;
+                  end
+
+                  QK_PSUM_WAIT_K: begin
+                      if (quant_psum_valid) begin
+                          psum_k_reg <= quant_psum_data;
+                          qk_state <= QK_PSUM_USE_PAIR;
+                      end
+                  end
+
+                  QK_PSUM_USE_PAIR: begin
+
+                      if (!psum_feed_phase) begin
+
+                          // First pass: maximum absolute values
+                          if (q_abs_now > q_max_abs)
+                              q_max_abs <= q_abs_now;
+
+                          if (k_abs_now > k_max_abs)
+                              k_max_abs <= k_abs_now;
+
+                          if (scan_index == QK_TOTAL-1) begin
+                              qk_state <= QK_PICK_SHIFT;
+                          end else begin
+                              scan_index <= scan_index + 1'b1;
+                              qk_state <= QK_PSUM_REQ_Q;
+                          end
+
+                      end else begin
+
+                          // Second pass: feed quantization units
+                          if (feed_index == QK_TOTAL-1) begin
+                              qk_state <= QK_DRAIN;
+                          end else begin
+                              feed_index <= feed_index + 1'b1;
+                              qk_state <= QK_PSUM_REQ_Q;
+                          end
+
+                      end
+                  end
+
+                  QK_PICK_SHIFT: begin
+
+                      q_shift_reg <= choose_shift(q_max_abs);
+                      k_shift_reg <= choose_shift(k_max_abs);
+
+                      feed_index <= 0;
+                      psum_feed_phase <= 1'b1;
+
+                      qk_state <= QK_PSUM_REQ_Q;
+                  end
+
+                  QK_DRAIN: begin
+
+                      // Wait until all valid samples have passed
+                      // through the arithmetic and write pipeline.
+                      if (valid_pipe == 3'b000) begin
+                          qk_state <= QK_IDLE;
+                          qk_busy <= 1'b0;
+                          qk_done <= 1'b1;
+                      end
+                  end
+
+                  default: begin
+                      qk_state <= QK_IDLE;
+                  end
+
+              endcase
+          end
+      end
+
+`ifndef SYNTHESIS
+      initial begin
+          if (DATA_PSUM_BITWIDTH != QK_DATA_WIDTH)
+              $fatal(1,
+                  "Integrated Q/K requires 20-bit PSUM data");
+
+          if (ATTENTION_PSUM_ENABLE == 0)
+              $fatal(1,
+                  "Integrated Q/K requires ATTENTION_PSUM_ENABLE");
+      end
+`endif
+
+    end else begin : GEN_NO_ATTENTION_QUANT
+
+      // Non-attention OpenEye backward compatibility.
+      assign quant_psum_req = 1'b0;
+      assign quant_psum_page = 4'd0;
+      assign quant_psum_feature = 3'd0;
+
+      assign quant_busy_o = 1'b0;
+      assign quant_done_o = 1'b0;
+
+      assign q8_data_o = 8'sd0;
+      assign k8_data_o = 8'sd0;
+
+      assign quant_q_shift_o = 7'd0;
+      assign quant_k_shift_o = 7'd0;
+
+    end
+  endgenerate
 
   //==========================================================================
   // Integrated Attention Softmax FSM

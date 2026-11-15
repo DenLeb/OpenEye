@@ -198,29 +198,18 @@ module attention_top #(
         .result_addr_o(result_addr)
     );
 
-    //===================== SINGLE-PORT PSUM READ ======================
 
-    wire psum_rd_req;
-    wire [3:0] psum_rd_page;
-    wire [2:0] psum_rd_feature;
+    //===================== SHARED PSUM OBSERVATION ======================
 
-    wire psum_rd_ready;
-    wire psum_rd_valid;
-    wire [19:0] psum_rd_data;
+    // Only external observation needs the OpenEye PSUM
+    // read interface. Quantization now accesses PSUM
+    // directly inside OpenEye_FPGA.
 
-    // Shared OpenEye PSUM read interface
-    wire core_psum_rd_req;
-    wire [3:0] core_psum_rd_page;
-    wire [2:0] core_psum_rd_feature;
+    wire observe_psum_req;
 
     wire core_psum_rd_ready;
     wire core_psum_rd_valid;
     wire [19:0] core_psum_rd_data;
-
-    // Quantization receives the existing OpenEye response.
-    assign psum_rd_ready = core_psum_rd_ready;
-    assign psum_rd_valid = core_psum_rd_valid;
-    assign psum_rd_data  = core_psum_rd_data;
 
     // Retain projection page during the complete GEMV operation
     reg [3:0] psum_active_page;
@@ -258,86 +247,111 @@ module attention_top #(
     // Quantization shift values
     wire [6:0] q_shift;
     wire [6:0] k_shift;
-    //===================== Q/K QUANTIZATION ===========================
 
-generate
-    if (INTEGRATION_STAGE >= 2) begin : GEN_QUANTIZATION
+    //===================== QUANTIZATION SIGNALS ========================
 
-        attention_qk_quantization_controller #(
-            .NUM_TOKENS(4),
-            .NUM_FEATURES(8),
-            .DATA_WIDTH(20),
-            .SHIFT_WIDTH(7),
-            .PSUM_SINGLE_PORT(PSUM_SINGLE_PORT)
-        ) u_quantization (
+    // Outputs from integrated OpenEye quantization.
+    wire core_quant_busy;
+    wire core_quant_done;
 
-            .clk_i(clk_i),
-            .rst_ni(rst_ni),
+    wire signed [7:0] core_q8_data;
+    wire signed [7:0] core_k8_data;
 
-            .start_i(quant_start),
-            .busy_o(quant_busy),
-            .done_o(quant_done),
+    wire [6:0] core_q_shift;
+    wire [6:0] core_k_shift;
 
-            // Legacy RAW Q
-            .q_raw_rd_token_o(quant_q_rd_token),
-            .q_raw_rd_feature_o(quant_q_rd_feature),
-            .q_raw_data_i(q_raw_data),
+    //===================== QUANTIZATION SELECTION ======================
 
-            // Legacy RAW K
-            .k_raw_rd_token_o(quant_k_rd_token),
-            .k_raw_rd_feature_o(quant_k_rd_feature),
-            .k_raw_data_i(k_raw_data),
+    generate
+        if ((INTEGRATION_STAGE >= 2) &&
+            (PSUM_SINGLE_PORT == 0)) begin : GEN_LEGACY_QUANTIZATION
 
-            // Direct Single-Port PSUM
-            .psum_rd_req_o(psum_rd_req),
-            .psum_rd_page_o(psum_rd_page),
-            .psum_rd_feature_o(psum_rd_feature),
+            // Legacy configuration:
+            // Original external controller and RAW result buffer.
+            attention_qk_quantization_controller #(
+                .NUM_TOKENS(4),
+                .NUM_FEATURES(8),
+                .DATA_WIDTH(20),
+                .SHIFT_WIDTH(7),
+                .PSUM_SINGLE_PORT(0)
+            ) u_quantization (
+                .clk_i(clk_i),
+                .rst_ni(rst_ni),
 
-            .psum_rd_ready_i(psum_rd_ready),
-            .psum_rd_valid_i(psum_rd_valid),
-            .psum_rd_data_i(psum_rd_data),
+                .start_i(quant_start),
+                .busy_o(quant_busy),
+                .done_o(quant_done),
 
-            // Quantized Q8
-            .q8_rd_token_i(q8_rd_token),
-            .q8_rd_feature_i(q8_rd_feature),
-            .q8_data_o(q8_data),
+                .q_raw_rd_token_o(quant_q_rd_token),
+                .q_raw_rd_feature_o(quant_q_rd_feature),
+                .q_raw_data_i(q_raw_data),
 
-            // Quantized K8
-            .k8_rd_token_i(k8_rd_token),
-            .k8_rd_feature_i(k8_rd_feature),
-            .k8_data_o(k8_data),
+                .k_raw_rd_token_o(quant_k_rd_token),
+                .k_raw_rd_feature_o(quant_k_rd_feature),
+                .k_raw_data_i(k_raw_data),
 
-            // Scaling
-            .q_shift_o(q_shift),
-            .k_shift_o(k_shift)
-        );
+                // Unused in legacy asynchronous RAW mode.
+                .psum_rd_req_o(),
+                .psum_rd_page_o(),
+                .psum_rd_feature_o(),
+                .psum_rd_ready_i(1'b0),
+                .psum_rd_valid_i(1'b0),
+                .psum_rd_data_i(20'sd0),
 
-    end else begin : GEN_NO_QUANTIZATION
+                .q8_rd_token_i(q8_rd_token),
+                .q8_rd_feature_i(q8_rd_feature),
+                .q8_data_o(q8_data),
 
-        assign quant_busy = 1'b0;
-        assign quant_done = 1'b0;
+                .k8_rd_token_i(k8_rd_token),
+                .k8_rd_feature_i(k8_rd_feature),
+                .k8_data_o(k8_data),
 
-        assign quant_q_rd_token = 2'd0;
-        assign quant_q_rd_feature = 3'd0;
-        assign quant_k_rd_token = 2'd0;
-        assign quant_k_rd_feature = 3'd0;
+                .q_shift_o(q_shift),
+                .k_shift_o(k_shift)
+            );
 
-        assign psum_rd_req = 1'b0;
-        assign psum_rd_page = 4'd0;
-        assign psum_rd_feature = 3'd0;
+        end else begin : GEN_INTERNAL_OR_DISABLED_QUANTIZATION
 
-        assign q8_data = 8'sd0;
-        assign k8_data = 8'sd0;
+            // No external controller in the integrated path.
+            assign quant_q_rd_token = 2'd0;
+            assign quant_q_rd_feature = 3'd0;
 
-        assign q_shift = 7'd0;
-        assign k_shift = 7'd0;
+            assign quant_k_rd_token = 2'd0;
+            assign quant_k_rd_feature = 3'd0;
 
-    end
-endgenerate
+            // Stage >= 2 uses the controller inside OpenEye.
+            // Stage 1 has quantization disabled.
+            assign quant_busy =
+                (INTEGRATION_STAGE >= 2)
+                    ? core_quant_busy : 1'b0;
+
+            assign quant_done =
+                (INTEGRATION_STAGE >= 2)
+                    ? core_quant_done : 1'b0;
+
+            assign q8_data =
+                (INTEGRATION_STAGE >= 2)
+                    ? core_q8_data : 8'sd0;
+
+            assign k8_data =
+                (INTEGRATION_STAGE >= 2)
+                    ? core_k8_data : 8'sd0;
+
+            assign q_shift =
+                (INTEGRATION_STAGE >= 2)
+                    ? core_q_shift : 7'd0;
+
+            assign k_shift =
+                (INTEGRATION_STAGE >= 2)
+                    ? core_k_shift : 7'd0;
+
+        end
+    endgenerate
     //===================== ONE SHARED OPENEYE ================================
     OpenEye_FPGA #(
         .ATTENTION_PSUM_ENABLE(1),
-        .ATTENTION_SOFTMAX_ENABLE(INTEGRATION_STAGE == 4)
+        .ATTENTION_QUANT_ENABLE((INTEGRATION_STAGE >= 2) && (PSUM_SINGLE_PORT != 0)),
+        .ATTENTION_SOFTMAX_ENABLE(INTEGRATION_STAGE == 4) 
     ) u_openeye (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
@@ -345,13 +359,36 @@ endgenerate
         .attention_mode_i(!qkt_mode || !busy_o),
         .psum_page_i(psum_active_page),
 
-        .psum_result_rd_req_i(core_psum_rd_req),
-        .psum_result_rd_page_i(core_psum_rd_page),
-        .psum_result_rd_feature_i(core_psum_rd_feature),
+
+        // External PSUM observation only.
+        // Quantization PSUM access is internal to OpenEye.
+        .psum_result_rd_req_i(observe_psum_req),
+        .psum_result_rd_page_i({
+            observe_select_i[1:0],
+            observe_token_i
+        }),
+        .psum_result_rd_feature_i(observe_feature_i),
 
         .psum_result_rd_ready_o(core_psum_rd_ready),
         .psum_result_rd_valid_o(core_psum_rd_valid),
         .psum_result_rd_data_o(core_psum_rd_data),
+
+        // Integrated Q/K Quantization Controller
+        .quant_start_i(quant_start),
+        .quant_busy_o(core_quant_busy),
+        .quant_done_o(core_quant_done),
+
+        .q8_rd_token_i(q8_rd_token),
+        .q8_rd_feature_i(q8_rd_feature),
+        .q8_data_o(core_q8_data),
+
+        .k8_rd_token_i(k8_rd_token),
+        .k8_rd_feature_i(k8_rd_feature),
+        .k8_data_o(core_k8_data),
+
+        .quant_q_shift_o(core_q_shift),
+        .quant_k_shift_o(core_k_shift),
+
 
         // Softmax FSM and probability storage are now inside OpenEye_FPGA.
         .softmax_start_i(softmax_start),
@@ -481,38 +518,22 @@ reg observe_pending;
 assign observe_ready_o =
     !busy_o &&
     !adapter_busy &&
-    ((INTEGRATION_STAGE < 2) || !quant_busy) &&
+    !quant_busy &&
     !observe_pending &&
     (
         ((PSUM_SINGLE_PORT != 0) && observe_raw_select)
-        ? (core_psum_rd_ready && !psum_rd_req)
+        ? core_psum_rd_ready
         : 1'b1
     );
 
 wire observe_accept = observe_req_i && observe_ready_o;
 
-// Only raw observations need access to OpenEye PSUM RAM.
-// Q8/K8 and shifts are already stored in the quantization controller.
-wire observe_psum_req =
+// Only external raw observations request OpenEye PSUM.
+// The internal Quantization FSM has its own internal request path.
+assign observe_psum_req =
     (PSUM_SINGLE_PORT != 0) &&
     observe_raw_select &&
     observe_accept;
-
-// Multiplex the single physical PSUM read interface.
-// Quantization has priority.
-assign core_psum_rd_req =
-    psum_rd_req || observe_psum_req;
-
-assign core_psum_rd_page =
-    psum_rd_req
-        ? psum_rd_page
-        : {observe_select_i[1:0], observe_token_i};
-
-assign core_psum_rd_feature =
-    psum_rd_req
-        ? psum_rd_feature
-        : observe_feature_i;
-
 // Observation response FSM
 always @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
