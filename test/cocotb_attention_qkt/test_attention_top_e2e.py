@@ -66,7 +66,7 @@ def test_attention_top_e2e(stage, test_case):
         "CLUSTER_ROWS": "2", "CLUSTER_COLUMNS": "2",
         "NUM_GLB_IACT": "3", "NUM_GLB_PSUM": "4", "NUM_GLB_WGHT": "3",
         "DATAFLOW": "row_stationary", "BRANCHES": "1", "BUFFER_WIDTH": "12",
-        "QUANT_AMOUNT": "1024", "RAM_CELLS": "32",
+        "QUANT_AMOUNT": "1024", "RAM_CELLS": "32", 
     }
     os.environ.update(settings)
 
@@ -117,7 +117,7 @@ def test_attention_top_e2e(stage, test_case):
         parameters={"INTEGRATION_STAGE": stage},
         sim_build=str(build),
         includes=[str(build), str(hdl_dir), str(Path(hdl_dir) / "include")],
-        defines={"NO_TRACE": "TRUE", "USE_INTERNAL_PARAMS_PE": "TRUE"},
+        defines={"NO_TRACE": "TRUE", "USE_INTERNAL_PARAMS_PE": "TRUE","ATTENTION_DMA_STALL_TEST": "TRUE"},
         simulator="icarus",
         force_compile=True,
         waves=False,
@@ -125,6 +125,7 @@ def test_attention_top_e2e(stage, test_case):
             **settings,
             "ATTENTION_E2E_PROJECTION_DIR": str(proj_dir.resolve()),
             "COCOTB_TEST_FILTER": f"{test_case}$",
+            "ATTENTION_E2E_BACKPRESSURE": "1",
         },
     )
 
@@ -201,6 +202,8 @@ async def check_stage1_projection(dut):
     # Initialize all top-level inputs
     dut.rst_ni.value = 0
     dut.start_i.value = 0
+
+    dut.tb_dma_stall_i.value = 0
 
     dut.iact_we_i.value = 0
     dut.iact_wr_addr_i.value = 0
@@ -418,6 +421,7 @@ async def check_complete_attention_dataflow(dut):
 
     dut.rst_ni.value = 0
     dut.start_i.value = 0
+    dut.tb_dma_stall_i.value = 0
     dut.iact_we_i.value = 0
     dut.iact_wr_addr_i.value = 0
     dut.iact_wr_data_i.value = 0
@@ -444,23 +448,123 @@ async def check_complete_attention_dataflow(dut):
     counts = {"projection": 0, "qkt": 0}
     seen_proj = set()
     seen_qkt = set()
+    observed_scores = np.zeros((4, 4), dtype=np.int64)
+    qkt_beats_per_token = [0, 0, 0, 0]
     finished = False
+
+    bp_enabled = True
+
+    bp_plan = {
+        (0, 0): 2,
+        (0, 2): 3,
+        (1, 3): 5,
+        (2, 1): 2,
+        (3, 3): 4,
+    }
+
+    bp_started = set()
+    bp_errors = []
+    bp_active_cycles = 0
+
+    async def stall_driver():
+        nonlocal bp_active_cycles
+
+        remaining = 0
+        held_payload = None
+
+        dut._log.info("STALL DRIVER IS RUNNING")
+
+        while not finished:
+            await FallingEdge(dut.clk_i)
+            await Timer(1, unit="ns")
+
+            valid = int(dut.u_openeye.enable_dma_o.value)
+            payload = (
+                int(dut.u_openeye.data_dma_o.value),
+                int(dut.u_openeye.last_data_o.value),
+            )
+
+            # Check that data and LAST remain stable while stalled.
+            if held_payload is not None:
+                if not valid or payload != held_payload:
+                    bp_errors.append(
+                        f"DMA output changed during stall: "
+                        f"expected={held_payload}, actual={payload}"
+                    )
+
+            stall = False
+
+            if remaining > 0:
+                stall = True
+                remaining -= 1
+
+            elif int(dut.qkt_mode_o.value) and valid:
+                token = int(dut.active_token_o.value)
+                beat = qkt_beats_per_token[token]
+                key = (token, beat)
+
+                if key in bp_plan and key not in bp_started:
+                    bp_started.add(key)
+                    remaining = bp_plan[key] - 1
+                    stall = True
+                    held_payload = payload
+
+                    dut._log.info(
+                        "BACKPRESSURE: token=%d beat=%d cycles=%d",
+                        token, beat, bp_plan[key]
+                    )
+
+            if not stall:
+                held_payload = None
+            else:
+                bp_active_cycles += 1
+
+            dut.tb_dma_stall_i.value = int(stall)
 
     async def monitor():
         nonlocal finished
         while not finished:
             await FallingEdge(dut.clk_i)
-            await Timer(1, unit="ns")
+            await Timer(2, unit="ns")
             if int(dut.dma_result_write_o.value):
                 token = int(dut.active_token_o.value)
                 mode = int(dut.qkt_mode_o.value)
                 if mode:
+                    beat = qkt_beats_per_token[token]
+
+                    assert beat < 4, (
+                        f"Extra QKT result for token {token}"
+                    )
+
+                    mapped_index = (
+                        ((beat & 1) << 1) |
+                        ((beat >> 1) & 1)
+                    )
+
+                    raw = int(
+                        dut.u_openeye.data_dma_o.value
+                    ) & ((1 << 20) - 1)
+
+                    signed_score = (
+                        raw - (1 << 20)
+                        if raw & (1 << 19)
+                        else raw
+                    )
+
+                    observed_scores[token, mapped_index] = signed_score
+
+                    qkt_beats_per_token[token] += 1
                     counts["qkt"] += 1
                     seen_qkt.add(token)
                 else:
                     counts["projection"] += 1
                     seen_proj.add((int(dut.active_projection_o.value), token))
 
+    stall_task = cocotb.start_soon(stall_driver())
+
+    dut._log.info(
+        "BACKPRESSURE DRIVER STARTED"
+    )
     monitor_task = cocotb.start_soon(monitor())
     dut._log.info("RTL E2E START: 12 Projection -> Quantization -> 4 QKT")
     await FallingEdge(dut.clk_i)
@@ -483,6 +587,22 @@ async def check_complete_attention_dataflow(dut):
     await FallingEdge(dut.clk_i)
     finished = True
     monitor_task.cancel()
+
+    if stall_task is not None:
+        stall_task.cancel()
+        dut.tb_dma_stall_i.value = 0
+
+        assert not bp_errors, "\n".join(bp_errors)
+
+        assert bp_started == set(bp_plan), (
+            f"Missing backpressure cases: "
+            f"{set(bp_plan) - bp_started}"
+        )
+
+        assert bp_active_cycles == sum(bp_plan.values()), (
+            f"Expected {sum(bp_plan.values())} stalled cycles, "
+            f"got {bp_active_cycles}"
+        )
     # Debug Q8/K8 after the complete attention operation
     for name, select, expected in [
         ("Q8", 3, q8),
@@ -534,17 +654,16 @@ async def check_complete_attention_dataflow(dut):
         f"Expected 4*4 QKT DMA result beats, got {counts['qkt']}"
     )
 
-    actual_scores = np.empty((4, 4), dtype=np.int64)
-    for token in range(4):
-        for j in range(4):
-            dut.score_rd_token_i.value = token
-            dut.score_rd_index_i.value = j
-            await Timer(1, unit="ns")
-            assert int(dut.score_rd_valid_o.value) == 1, (
-                f"Missing score S[{token},{j}]"
-            )
-            raw = int(dut.score_rd_data_o.value)
-            actual_scores[token, j] = raw - (1 << 20) if (raw & (1 << 19)) else raw
+    assert qkt_beats_per_token == [4, 4, 4, 4], (
+        f"Invalid QKT beat counts: "
+        f"{qkt_beats_per_token}"
+    )
+
+    actual_scores = observed_scores
+
+    assert int(dut.score_rd_valid_o.value) == 0, (
+        "Stage 4 must not expose a retained score buffer"
+    )
 
     dut._log.info("Expected quantization shifts: Q=%s K=%s", q_shift, k_shift)
     dut._log.info("Expected score matrix:\n%s", golden_scores)
@@ -632,6 +751,126 @@ async def check_complete_attention_dataflow(dut):
         assert abs(row_sum - 32768) <= 2, (
             f"Invalid probability sum in row {token}: {row_sum}"
         )
+    
+    # =========================================================
+    # Repeated Attention Run — WITHOUT global reset
+    # =========================================================
+
+    dut._log.info("START SECOND ATTENTION RUN WITHOUT RESET")
+
+    second_counts = {"projection": 0, "qkt": 0}
+    second_beats = [0, 0, 0, 0]
+    second_scores = np.zeros((4, 4), dtype=np.int64)
+
+    second_finished = False
+    softmax_cleared = False
+
+    async def monitor_second_run():
+        nonlocal second_finished, softmax_cleared
+
+        while not second_finished:
+            await FallingEdge(dut.clk_i)
+            await Timer(1, unit="ns")
+
+            if int(dut.softmax_complete_o.value) == 0:
+                softmax_cleared = True
+
+            if not int(dut.dma_result_write_o.value):
+                continue
+
+            if not int(dut.qkt_mode_o.value):
+                second_counts["projection"] += 1
+                continue
+
+            token = int(dut.active_token_o.value)
+            beat = second_beats[token]
+
+            assert beat < 4, (
+                f"Second run: extra QKT beat for token {token}"
+            )
+
+            mapped_index = ((beat & 1) << 1) | ((beat >> 1) & 1)
+
+            raw = int(dut.u_openeye.data_dma_o.value) & ((1 << 20) - 1)
+            value = raw - (1 << 20) if raw & (1 << 19) else raw
+
+            second_scores[token, mapped_index] = value
+            second_beats[token] += 1
+            second_counts["qkt"] += 1
+
+    second_monitor = cocotb.start_soon(monitor_second_run())
+
+    assert int(dut.done_o.value) == 0, (
+        "DONE must be low before the second start"
+    )
+
+    # Start a new run without asserting rst_ni
+    await FallingEdge(dut.clk_i)
+    dut.start_i.value = 1
+
+    await FallingEdge(dut.clk_i)
+    dut.start_i.value = 0
+
+    try:
+        await with_timeout(
+            RisingEdge(dut.done_o),
+            15_000_000,
+            "ns"
+        )
+    finally:
+        await FallingEdge(dut.clk_i)
+        second_finished = True
+        second_monitor.cancel()
+
+    # Check that the second run really executed
+    assert second_counts["projection"] == 384, second_counts
+    assert second_counts["qkt"] == 16, second_counts
+    assert second_beats == [4, 4, 4, 4], second_beats
+
+    assert softmax_cleared, (
+        "Softmax completion was not cleared during second run"
+    )
+
+    assert np.array_equal(second_scores, golden_scores), (
+        f"Second run QKT mismatch\n"
+        f"Expected:\n{golden_scores}\n"
+        f"Actual:\n{second_scores}"
+    )
+
+    assert int(dut.softmax_complete_o.value) == 1, (
+        "Second run Softmax incomplete"
+    )
+
+    # Verify all 16 probabilities after the second run
+    second_probabilities = np.empty((4, 4), dtype=np.int64)
+
+    for token in range(4):
+        for j in range(4):
+            dut.prob_rd_token_i.value = token
+            dut.prob_rd_index_i.value = j
+
+            await Timer(1, unit="ns")
+
+            assert int(dut.prob_rd_valid_o.value) == 1, (
+                f"Second run missing probability P[{token},{j}]"
+            )
+
+            second_probabilities[token, j] = int(
+                dut.prob_rd_data_o.value
+            )
+
+    assert np.array_equal(
+        second_probabilities,
+        golden_probabilities
+    ), (
+        f"Second run Softmax mismatch\n"
+        f"Expected:\n{golden_probabilities}\n"
+        f"Actual:\n{second_probabilities}"
+    )
+
+    dut._log.info(
+        "PASS: TWO COMPLETE ATTENTION RUNS WITHOUT RESET"
+    )
 
     dut._log.info(
         "PASS: 12 projections, quantization, 4 QKT GEMVs, "

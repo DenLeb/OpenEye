@@ -317,6 +317,12 @@ module OpenEye_FPGA #(
     output wire [6:0] quant_q_shift_o,
     output wire [6:0] quant_k_shift_o,
 
+    input wire qkt_capture_enable_i,
+    input wire [1:0] qkt_capture_token_i,
+
+    output wire qkt_capture_ready_o,
+    output wire qkt_scores_complete_o,
+
     // Optional integrated 4x4 attention Softmax FSM (disabled by default).
     // QKT score storage remains outside OpenEye_FPGA.
     input wire softmax_start_i,
@@ -905,180 +911,309 @@ module OpenEye_FPGA #(
 
   //==========================================================================
   // Integrated Attention Softmax FSM
-  // The FSM, row score register, and probability storage are native to this
-  // module. Only the existing attention_softmax_row arithmetic hierarchy is
-  // instantiated. QKT scores remain in attention_qkt_score_buffer at top level.
+  // The FSM, row score register, and probability storage are native to this module. 
   //==========================================================================
+  //============================================================
+  // Direct DMA-to-Softmax Row Integration
+  //============================================================
+
   generate
-    if (ATTENTION_SOFTMAX_ENABLE != 0) begin : GEN_ATTENTION_SOFTMAX
-    localparam [2:0]
-        SM_IDLE      = 3'd0,
-        SM_LOAD_ROW  = 3'd1,
-        SM_ROW_START = 3'd2,
-        SM_ROW_WAIT  = 3'd3,
-        SM_STORE_ROW = 3'd4,
-        SM_FINISH    = 3'd5;
+  if (ATTENTION_SOFTMAX_ENABLE != 0) begin : GEN_ATTENTION_SOFTMAX
 
-    reg [2:0] sm_state;
+      localparam [2:0]
+          SM_IDLE      = 3'd0,
+          SM_WAIT_ROW  = 3'd1,
+          SM_ROW_START = 3'd2,
+          SM_ROW_WAIT  = 3'd3,
+          SM_STORE_ROW = 3'd4,
+          SM_FINISH    = 3'd5;
 
-    // Current position in the 4x4 matrix
-    reg [1:0] sm_row_index;
-    reg [1:0] sm_col_index;
+      reg [2:0] sm_state;
 
-    // Four 20-bit scores for the current row
-    reg [79:0] sm_row_scores_reg;
+      // Existing 80-bit row staging register
+      reg [79:0] sm_row_scores_reg;
 
-    // Capture quantization shifts at start
-    reg [6:0] sm_q_shift_reg;
-    reg [6:0] sm_k_shift_reg;
+      // Direct DMA capture control
+      reg [1:0] sm_capture_index;
+      reg [1:0] sm_capture_token;
 
-    // Result storage: 16 probabilities
-    reg [15:0] sm_probability_mem [0:15];
-    reg [15:0] sm_probability_valid;
+      reg       sm_row_staged_valid;
+      reg [1:0] sm_staged_token;
+      reg [1:0] sm_processing_token;
 
-    // Row processor interface
-    wire [63:0] sm_row_probabilities;
-    wire        sm_row_start;
-    wire        sm_row_busy;
-    wire        sm_row_done;
+      reg [2:0] sm_captured_rows;
 
-    // Score Buffer read address
-    assign softmax_score_rd_token_o = sm_row_index;
-    assign softmax_score_rd_index_o = sm_col_index;
+      // Quantization shifts
+      reg [6:0] sm_q_shift_reg;
+      reg [6:0] sm_k_shift_reg;
 
-    // Row processor control
-    assign sm_row_start = (sm_state == SM_ROW_START);
+      // Existing probability storage
+      reg [15:0] sm_probability_mem [0:15];
+      reg [15:0] sm_probability_valid;
 
-    assign softmax_busy_o = (sm_state != SM_IDLE) && (sm_state != SM_FINISH);
-    assign softmax_done_o = (sm_state == SM_FINISH);
+      // Row processor
+      wire [63:0] sm_row_probabilities;
+      wire sm_row_start;
+      wire sm_row_busy;
+      wire sm_row_done;
 
-    // All 16 probabilities are available
-    assign softmax_complete_o = &sm_probability_valid;
+      // Accepted QKT DMA output beat
+      wire sm_capture_fire =
+          qkt_capture_enable_i &&
+          enable_dma_o &&
+          ready_dma_i;
 
+      // Preserve output order 0,2,1,3
+      wire [1:0] sm_mapped_index = {
+          sm_capture_index[0],
+          sm_capture_index[1]
+      };
 
-    // Row-Parallel Softmax processor
-    attention_softmax_row u_attention_softmax_row (
-        .clk_i           (clk_i),
-        .rst_ni          (rst_n),
-        .start_i         (sm_row_start),
+      // Next QKT GEMV may start only if staging is free
+      assign qkt_capture_ready_o =
+          !sm_row_staged_valid &&
+          (sm_capture_index == 2'd0);
 
-        .scores_i        (sm_row_scores_reg),
-        .q_shift_i       (sm_q_shift_reg),
-        .k_shift_i       (sm_k_shift_reg),
+      // All four QKT rows have been captured
+      assign qkt_scores_complete_o =
+          (sm_captured_rows == 3'd4);
 
-        .probabilities_o (sm_row_probabilities),
-        .busy_o          (sm_row_busy),
-        .done_o          (sm_row_done)
-    );
+      assign sm_row_start =
+          (sm_state == SM_ROW_START);
 
-    wire [3:0] sm_prob_read_addr;
+      assign softmax_busy_o =
+          (sm_state != SM_IDLE) &&
+          (sm_state != SM_FINISH);
 
-    assign sm_prob_read_addr = {
-        softmax_prob_rd_token_i,
-        softmax_prob_rd_index_i
-    };
+      assign softmax_done_o =
+          (sm_state == SM_FINISH);
 
-    assign softmax_prob_rd_valid_o = sm_probability_valid[sm_prob_read_addr];
+      assign softmax_complete_o =
+          &sm_probability_valid;
 
-    assign softmax_prob_rd_data_o = softmax_prob_rd_valid_o
-                        ? sm_probability_mem[sm_prob_read_addr]
-                        : 16'd0;
-
-                        
-    always @(posedge clk_i or negedge rst_n) begin
-        if (!rst_n) begin
-            sm_state             <= SM_IDLE;
-            sm_row_index         <= 2'd0;
-            sm_col_index         <= 2'd0;
-            sm_row_scores_reg    <= 80'd0;
-            sm_q_shift_reg       <= 7'd0;
-            sm_k_shift_reg       <= 7'd0;
-            sm_probability_valid <= 16'd0;
-        end else begin
-            case (sm_state)
-
-                SM_IDLE: begin
-                    if (softmax_start_i) begin
-                        sm_row_index         <= 2'd0;
-                        sm_col_index         <= 2'd0;
-                        sm_row_scores_reg    <= 80'd0;
-                        sm_q_shift_reg       <= softmax_q_shift_i;
-                        sm_k_shift_reg       <= softmax_k_shift_i;
-                        sm_probability_valid <= 16'd0;
-                        sm_state             <= SM_LOAD_ROW;
-                    end
-                end
-
-                SM_LOAD_ROW: begin
-                    if (softmax_score_rd_valid_i) begin
-                        sm_row_scores_reg[sm_col_index*20 +: 20]
-                            <= softmax_score_rd_data_i;
-
-                        if (sm_col_index == 2'd3) begin
-                            sm_col_index <= 2'd0;
-                            sm_state     <= SM_ROW_START;
-                        end else begin
-                            sm_col_index <= sm_col_index + 1'b1;
-                        end
-                    end
-                end
-
-                SM_ROW_START: begin
-                    sm_state <= SM_ROW_WAIT;
-                end
-
-                SM_ROW_WAIT: begin
-                    if (sm_row_done) begin
-                        sm_state <= SM_STORE_ROW;
-                    end
-                end
-
-                SM_STORE_ROW: begin
-                    sm_probability_mem[{sm_row_index, 2'b00}]
-                        <= sm_row_probabilities[15:0];
-
-                    sm_probability_mem[{sm_row_index, 2'b01}]
-                        <= sm_row_probabilities[31:16];
-
-                    sm_probability_mem[{sm_row_index, 2'b10}]
-                        <= sm_row_probabilities[47:32];
-
-                    sm_probability_mem[{sm_row_index, 2'b11}]
-                        <= sm_row_probabilities[63:48];
-
-                    sm_probability_valid[{sm_row_index, 2'b00} +: 4]
-                        <= 4'b1111;
-
-                    if (sm_row_index == 2'd3) begin
-                        sm_state <= SM_FINISH;
-                    end else begin
-                        sm_row_index      <= sm_row_index + 1'b1;
-                        sm_col_index      <= 2'd0;
-                        sm_row_scores_reg <= 80'd0;
-                        sm_state          <= SM_LOAD_ROW;
-                    end
-                end
-
-                SM_FINISH: begin
-                    sm_state <= SM_IDLE;
-                end
-
-                default: begin
-                    sm_state <= SM_IDLE;
-                end
-
-            endcase
-        end
-    end
-    end else begin : GEN_NO_ATTENTION_SOFTMAX
+      // Legacy external score-read interface is unused
       assign softmax_score_rd_token_o = 2'd0;
       assign softmax_score_rd_index_o = 2'd0;
+
+      // Existing row-parallel arithmetic module
+      attention_softmax_row u_attention_softmax_row (
+          .clk_i(clk_i),
+          .rst_ni(rst_n),
+          .start_i(sm_row_start),
+
+          .scores_i(sm_row_scores_reg),
+          .q_shift_i(sm_q_shift_reg),
+          .k_shift_i(sm_k_shift_reg),
+
+          .probabilities_o(sm_row_probabilities),
+          .busy_o(sm_row_busy),
+          .done_o(sm_row_done)
+      );
+
+      // Existing probability readback
+      wire [3:0] sm_prob_read_addr = {
+          softmax_prob_rd_token_i,
+          softmax_prob_rd_index_i
+      };
+
+      assign softmax_prob_rd_valid_o =
+          sm_probability_valid[sm_prob_read_addr];
+
+      assign softmax_prob_rd_data_o =
+          softmax_prob_rd_valid_o
+          ? sm_probability_mem[sm_prob_read_addr]
+          : 16'd0;
+
+      always @(posedge clk_i or negedge rst_n) begin
+          if (!rst_n) begin
+              sm_state <= SM_IDLE;
+
+              sm_row_scores_reg <= 80'd0;
+              sm_capture_index <= 2'd0;
+              sm_capture_token <= 2'd0;
+
+              sm_row_staged_valid <= 1'b0;
+              sm_staged_token <= 2'd0;
+              sm_processing_token <= 2'd0;
+              sm_captured_rows <= 3'd0;
+
+              sm_q_shift_reg <= 7'd0;
+              sm_k_shift_reg <= 7'd0;
+
+              sm_probability_valid <= 16'd0;
+
+          end else if (softmax_start_i) begin
+
+              // Initialize a new attention transaction
+              sm_state <= SM_WAIT_ROW;
+
+              sm_row_scores_reg <= 80'd0;
+              sm_capture_index <= 2'd0;
+              sm_capture_token <= 2'd0;
+
+              sm_row_staged_valid <= 1'b0;
+              sm_staged_token <= 2'd0;
+              sm_processing_token <= 2'd0;
+              sm_captured_rows <= 3'd0;
+
+              sm_q_shift_reg <= softmax_q_shift_i;
+              sm_k_shift_reg <= softmax_k_shift_i;
+
+              sm_probability_valid <= 16'd0;
+
+          end else begin
+
+              //==========================================
+              // DMA Direct Capture
+              //==========================================
+
+              if (sm_capture_fire &&
+                  !sm_row_staged_valid) begin
+
+                  if (sm_capture_index == 2'd0)
+                      sm_capture_token <=
+                          qkt_capture_token_i;
+
+                  sm_row_scores_reg[
+                      sm_mapped_index*20 +: 20
+                  ] <= data_dma_o[19:0];
+
+                  if (sm_capture_index == 2'd3) begin
+
+                      sm_capture_index <= 2'd0;
+
+                      sm_row_staged_valid <= 1'b1;
+                      sm_staged_token <=
+                          qkt_capture_token_i;
+
+                      sm_captured_rows <=
+                          sm_captured_rows + 3'd1;
+
+                  end else begin
+
+                      sm_capture_index <=
+                          sm_capture_index + 2'd1;
+
+                  end
+              end
+
+              //==========================================
+              // Softmax Row Controller
+              //==========================================
+
+              case (sm_state)
+
+                  SM_IDLE: begin
+                  end
+
+                  SM_WAIT_ROW: begin
+                      if (sm_row_staged_valid) begin
+
+                          sm_processing_token <=
+                              sm_staged_token;
+
+                          sm_state <= SM_ROW_START;
+                      end
+                  end
+
+                  SM_ROW_START: begin
+
+                      // Row processor captures scores_i
+                      // at this clock edge.
+                      sm_row_staged_valid <= 1'b0;
+
+                      sm_state <= SM_ROW_WAIT;
+                  end
+
+                  SM_ROW_WAIT: begin
+                      if (sm_row_done)
+                          sm_state <= SM_STORE_ROW;
+                  end
+
+                  SM_STORE_ROW: begin
+
+                      sm_probability_mem[
+                          {sm_processing_token, 2'b00}
+                      ] <= sm_row_probabilities[15:0];
+
+                      sm_probability_mem[
+                          {sm_processing_token, 2'b01}
+                      ] <= sm_row_probabilities[31:16];
+
+                      sm_probability_mem[
+                          {sm_processing_token, 2'b10}
+                      ] <= sm_row_probabilities[47:32];
+
+                      sm_probability_mem[
+                          {sm_processing_token, 2'b11}
+                      ] <= sm_row_probabilities[63:48];
+
+                      sm_probability_valid[
+                          {sm_processing_token, 2'b00}
+                          +: 4
+                      ] <= 4'b1111;
+
+                      if (sm_processing_token == 2'd3)
+                          sm_state <= SM_FINISH;
+                      else
+                          sm_state <= SM_WAIT_ROW;
+
+                  end
+
+                  SM_FINISH: begin
+                      sm_state <= SM_IDLE;
+                  end
+
+                  default: begin
+                      sm_state <= SM_IDLE;
+                  end
+
+              endcase
+          end
+      end
+
+  `ifndef SYNTHESIS
+      always @(posedge clk_i) begin
+          if (rst_n && !softmax_start_i &&
+              sm_capture_fire) begin
+
+              if (sm_row_staged_valid)
+                  $fatal(1,
+                      "Softmax staging overflow");
+
+              if (sm_captured_rows >= 3'd4)
+                  $fatal(1,
+                      "More than four QKT rows");
+
+              if ((sm_capture_index == 2'd3) !=
+                  last_data_o)
+                  $fatal(1,
+                      "QKT beat count / LAST mismatch");
+
+              if ((sm_capture_index != 2'd0) &&
+                  (qkt_capture_token_i != sm_capture_token))
+                  $fatal(1,
+                      "QKT token changed mid-row");
+          end
+      end
+  `endif
+
+  end else begin : GEN_NO_ATTENTION_SOFTMAX
+
+      assign qkt_capture_ready_o = 1'b0;
+      assign qkt_scores_complete_o = 1'b0;
+
+      assign softmax_score_rd_token_o = 2'd0;
+      assign softmax_score_rd_index_o = 2'd0;
+
       assign softmax_prob_rd_data_o = 16'd0;
       assign softmax_prob_rd_valid_o = 1'b0;
+
       assign softmax_busy_o = 1'b0;
       assign softmax_done_o = 1'b0;
       assign softmax_complete_o = 1'b0;
-    end
+
+  end
   endgenerate
 
   RST_SYNC rst_sync_wrapper (

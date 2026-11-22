@@ -38,6 +38,9 @@ module attention_top #(
     input  wire clk_i,
     input  wire rst_ni,
     input  wire start_i,
+    `ifdef ATTENTION_DMA_STALL_TEST
+        input wire tb_dma_stall_i,
+    `endif
     output wire busy_o,
     output wire done_o,
     output wire scores_complete_o,
@@ -102,21 +105,16 @@ module attention_top #(
     wire operands_ready;
     wire gemv_done;
 
+    wire core_qkt_capture_ready;
+    wire core_qkt_scores_complete;
+    
     wire softmax_start;
     wire softmax_done;
     wire softmax_busy;
 
-    // Softmax Score Buffer read requests
-    wire [1:0] softmax_score_rd_token;
-    wire [1:0] softmax_score_rd_index;
-
     // Shared Score Buffer read response
     wire signed [19:0] score_buffer_rd_data;
     wire score_buffer_rd_valid;
-
-    // Selected read address
-    wire [1:0] selected_score_rd_token;
-    wire [1:0] selected_score_rd_index;
 
     attention_top_scheduler #(
         .INTEGRATION_STAGE(INTEGRATION_STAGE)
@@ -144,7 +142,8 @@ module attention_top #(
         .busy_o(busy_o),
         .softmax_start_o(softmax_start),
         .scores_complete_i(scores_complete_o),
-        .softmax_done_i(softmax_done),
+        .softmax_capture_ready_i(core_qkt_capture_ready),
+        .softmax_complete_i(softmax_complete_o),
         .done_o(done_o)
     );
     assign active_token_o = token_select;
@@ -166,6 +165,20 @@ module attention_top #(
     wire dma_output_valid;
     wire dma_output_last;
     wire dma_output_ready;
+    `ifdef ATTENTION_DMA_STALL_TEST
+
+        wire core_dma_output_ready =
+            dma_output_ready && !tb_dma_stall_i;
+
+        wire adapter_dma_output_valid =
+            dma_output_valid && !tb_dma_stall_i;
+
+        `else
+
+        wire core_dma_output_ready = dma_output_ready;
+        wire adapter_dma_output_valid = dma_output_valid;
+
+    `endif
     wire adapter_busy;
     wire result_write;
     wire [DMA_WIDTH-1:0] result_data;
@@ -190,7 +203,7 @@ module attention_top #(
         .dma_data_o(dma_input_data),
         .dma_valid_o(dma_input_valid),
         .dma_result_data_i(dma_output_data),
-        .dma_result_valid_i(dma_output_valid),
+        .dma_result_valid_i(adapter_dma_output_valid),
         .dma_result_last_i(dma_output_last),
         .dma_result_ready_o(dma_output_ready),
         .result_write_o(result_write),
@@ -389,15 +402,19 @@ module attention_top #(
         .quant_q_shift_o(core_q_shift),
         .quant_k_shift_o(core_k_shift),
 
+        .qkt_capture_enable_i(qkt_result_enable),
+        .qkt_capture_token_i(token_select),
+        .qkt_capture_ready_o(core_qkt_capture_ready),
+        .qkt_scores_complete_o(core_qkt_scores_complete),
 
         // Softmax FSM and probability storage are now inside OpenEye_FPGA.
         .softmax_start_i(softmax_start),
         .softmax_q_shift_i(q_shift),
         .softmax_k_shift_i(k_shift),
-        .softmax_score_rd_token_o(softmax_score_rd_token),
-        .softmax_score_rd_index_o(softmax_score_rd_index),
-        .softmax_score_rd_data_i(score_buffer_rd_data),
-        .softmax_score_rd_valid_i(score_buffer_rd_valid),
+        .softmax_score_rd_token_o(),
+        .softmax_score_rd_index_o(),
+        .softmax_score_rd_data_i(20'sd0),
+        .softmax_score_rd_valid_i(1'b0),
         .softmax_prob_rd_token_i(prob_rd_token_i),
         .softmax_prob_rd_index_i(prob_rd_index_i),
         .softmax_prob_rd_data_o(prob_rd_data_o),
@@ -415,7 +432,7 @@ module attention_top #(
         .data_dma_o(dma_output_data),
         .enable_dma_o(dma_output_valid),
         .last_data_o(dma_output_last),
-        .ready_dma_i(dma_output_ready)
+        .ready_dma_i(core_dma_output_ready)
     );
 
     //===================== PROJECTION DMA MEMORY =============================
@@ -592,11 +609,6 @@ always @(posedge clk_i or negedge rst_ni) begin
     end
 end
 
-    // Shared Score Buffer read interface across all configurations.
-    assign selected_score_rd_token =
-        softmax_busy ? softmax_score_rd_token : score_rd_token_i;
-    assign selected_score_rd_index =
-        softmax_busy ? softmax_score_rd_index : score_rd_index_i;
     assign score_rd_data_o = score_buffer_rd_data;
     assign score_rd_valid_o = score_buffer_rd_valid;
 
@@ -676,27 +688,55 @@ end
 
     //===================== QKT SCORE RESULT BUFFER ===========================
     // OpenEye K8/N4 row-stationary output DMA beat order = 0, 2, 1, 3.
-    wire [1:0] mapped_score_index = {result_addr[0], result_addr[1]};
-    wire score_write = qkt_result_enable && result_write && (result_addr < 4);
-    
-    attention_qkt_score_buffer #(
-        .NUM_TOKENS(4),
-        .NUM_SCORES(4),
-        .DATA_WIDTH(20)
-    ) u_qkt_score_buffer (
-        .clk_i(clk_i),
-        .rst_ni(rst_ni),
-        .clear_i(qkt_memory_clear),
-        .write_en_i(score_write),
-        .write_token_i(token_select),
-        .write_score_i(mapped_score_index),
-        .write_data_i(result_data[19:0]),
-        .read_token_i(selected_score_rd_token),
-        .read_score_i(selected_score_rd_index),
-        .read_data_o(score_buffer_rd_data),
-        .read_valid_o(score_buffer_rd_valid),
-        .complete_o(scores_complete_o)
-    );
+    if (INTEGRATION_STAGE == 3) begin :
+        GEN_EXTERNAL_QKT_SCORE_BUFFER
+
+        // Preserve standalone Stage 3 behavior.
+
+        wire [1:0] mapped_score_index = {
+            result_addr[0],
+            result_addr[1]
+        };
+
+        wire score_write =
+            qkt_result_enable &&
+            result_write &&
+            (result_addr < 4);
+
+        attention_qkt_score_buffer #(
+            .NUM_TOKENS(4),
+            .NUM_SCORES(4),
+            .DATA_WIDTH(20)
+        ) u_qkt_score_buffer (
+            .clk_i(clk_i),
+            .rst_ni(rst_ni),
+            .clear_i(qkt_memory_clear),
+
+            .write_en_i(score_write),
+            .write_token_i(token_select),
+            .write_score_i(mapped_score_index),
+            .write_data_i(result_data[19:0]),
+
+            .read_token_i(score_rd_token_i),
+            .read_score_i(score_rd_index_i),
+
+            .read_data_o(score_buffer_rd_data),
+            .read_valid_o(score_buffer_rd_valid),
+            .complete_o(scores_complete_o)
+        );
+
+    end else begin :
+        GEN_DIRECT_QKT_SOFTMAX
+
+        // Stage 4 has no external Score Buffer.
+        assign score_buffer_rd_data = 20'sd0;
+        assign score_buffer_rd_valid = 1'b0;
+
+        // Completion now means four QKT rows captured.
+        assign scores_complete_o =
+            core_qkt_scores_complete;
+
+    end
         end else begin : GEN_NO_QKT
             assign packer_q8_rd_token = 2'd0;
             assign packer_q8_rd_feature = 3'd0;
